@@ -73,16 +73,25 @@ _SLUG = re.compile(r"[^A-Z0-9]")
 
 # ─── static metadata (unchanged) ─────────────────────────────────────
 LIBRARY_META = {
-    "TLÜAR": ("Tallinna Ülikooli Akadeemiline Raamatukogu",
-              "Rävala puiestee 10, Tallinn, Estonia"),
-    "TLKR":  ("Tallinna Keskraamatukogu – Peahoone",
-              "Estonia pst 8, Tallinn, Estonia"),
-    "TARTU": ("Tartu Ülikooli Raamatukogu",
-              "W. Struve 1, Tartu, Estonia"),
-    "EKA":   ("Eesti Kunstiakadeemia Raamatukogu",
-              "Kotzebue 1, Tallinn, Estonia"),
-    "EMU":   ("Eesti Maaülikooli Raamatukogu",
-              "Fr. R. Kreutzwaldi 1A, Tartu, Estonia"),
+    # — national & university level —
+    "RaRa":    ("Eesti Rahvusraamatukogu",              "Tõnismägi 2, Tallinn, Estonia"),
+    "TÜR":     ("Tartu Ülikooli Raamatukogu",           "W. Struve 1, Tartu, Estonia"),
+    "TLÜAR":   ("Tallinna Ülikooli Akadeemiline RK",    "Rävala puiestee 10, Tallinn, Estonia"),  # you already had this
+    "TalTech": ("TalTech Raamatukogu (peahoone)",       "Akadeemia tee 1, Tallinn, Estonia"),
+    "EKA":     ("Eesti Kunstiakadeemia Raamatukogu",     "Kotzebue 1, Tallinn, Estonia"),
+    "EMU":     ("Eesti Maaülikooli Raamatukogu",        "Fr. R. Kreutzwaldi 1A, Tartu, Estonia"),
+
+    # — public-library systems —
+    "TlnRK":   ("Tallinna Keskraamatukogu (süsteem)",   "Estonia pst 8, Tallinn, Estonia"),
+    "Tartu LR":("Tartu Linnaraamatukogu",               "Kompanii 3/5, Tartu, Estonia"),
+
+    # — defence / government —
+    "KMAR":    ("Kaitseväe Akadeemia Raamatukogu",      "Riia 21, Tartu, Estonia"),
+    "KV":      ("Kaitseväe Peastaabi Raamatukogu",      "Juhkentali 58, Tallinn, Estonia"),
+
+    # — smaller but recurring —
+    "TARTU":   ("Tartu Ülikooli Raamatukogu (alias)",   "W. Struve 1, Tartu, Estonia"),
+    "TLKR":    ("Tallinna Keskraamatukogu – Peahoone",  "Estonia pst 8, Tallinn, Estonia"),      # already in your list
 }
 
 BRANCH_META = {
@@ -133,19 +142,118 @@ def _unwrap_frameset(url: str) -> str:
     rec = soup.select_one("a[href*='/record=b']")
     return urllib.parse.urljoin(url, rec["href"]) if rec else url
 
-def resolve(loc: str) -> Tuple[str, str]:
+def resolve(loc: str) -> tuple[str, str]:
+    """
+    Map an ESTER holdings location to (nice-name, address).
+
+    • “TlnRK *branch* …”  → use the *first* word after TlnRK
+      (“Pirita”, “Kalamaja”, …) and look it up in BRANCH_META.
+    • other known SIGL prefixes (RaRa, TÜR …) via LIBRARY_META.
+    • everything unknown gets its own marker.
+    """
+    # —— Tallinna Keskraamatukogu system ———————————————
     if loc.startswith("TlnRK"):
-        br = slugify(loc.split(maxsplit=1)[1]) if len(loc.split()) > 1 else ""
-        return BRANCH_META.get(br, ("Tallinna Keskraamatukogu", "Tallinn"))
-    for cd, (nm, ad) in LIBRARY_META.items():
-        if loc.startswith(cd):
-            return nm, ad
+        # strip the prefix and grab just the first word
+        rest = loc.removeprefix("TlnRK").lstrip(" ,:-")
+        branch_key = slugify(rest.split()[0]) if rest else ""
+        if not branch_key:                          # plain “TlnRK”
+            return LIBRARY_META["TLKR"]             # Peahoone
+        return BRANCH_META.get(branch_key,
+                               ("Tallinna Keskraamatukogu", "Tallinn"))
+
+    # —— all other libraries by their SIGL ———————————————
+    for sigl, (name, addr) in LIBRARY_META.items():
+        if loc.startswith(sigl):
+            return name, addr
+
+    # —— totally unknown string ———————————————
     return loc, ""
+
+def _dbg_resolve(raw: str, out: tuple[str, str]) -> None:
+    if DEBUG:
+        log("DBG-loc", f"{raw!r} → {out!r}", "dim")
 
 def strip_ctrl(t: str) -> str:
     return "".join(ch for ch in t
                    if unicodedata.category(ch)[0] != "C"
                    and unicodedata.category(ch)   != "Cf")
+
+# ─── helpers used for fuzzy comparisons ─────────────────────────────
+_norm_re = re.compile(r"[^a-z0-9]+")
+
+def _ascii_fold(s: str) -> str:
+    """Unicode → pure ASCII, lower-case."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore") \
+                        .decode("ascii").lower()
+
+def _tokenise(s: str) -> set[str]:
+    """Return a *set* of alphanumeric tokens (ASCII-folded, lower-case)."""
+    return {tok for tok in _norm_re.split(_ascii_fold(s)) if tok}
+
+def _surname(author: str) -> str:
+    parts = re.sub(r"[^A-Za-z0-9 ]+", " ",
+                   unicodedata.normalize("NFKD", author)
+                   .encode("ascii", "ignore").decode("ascii")).lower().split()
+    return parts[-1] if parts else ""
+
+def _ester_fields(record_url: str) -> tuple[str, str]:
+    """
+    Return (title, author_text) extracted from one ESTER record page.
+      • *title*   →  the main display title  (Pealkiri  ♦  Ühtluspealkiri)
+      • *author*  →  the full author field  (Autor …)
+
+    If parsing fails, either field is returned as "".
+    """
+    html = _download(record_url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    # ❶ MAIN TITLE  (either <h1 class="title"> or the Pealkiri row)
+    tag = soup.select_one("h1.title, h2.title")
+    if not tag:                                             # fallback
+        tag = soup.select_one("td.bibInfoLabel:-soup-contains('Pealkiri') "
+                              "+ td.bibInfoData")
+    title = strip_ctrl(tag.get_text(" ", strip=True)) if tag else ""
+
+    # ❷ AUTHOR
+    tag = soup.select_one("td.bibInfoLabel:-soup-contains('Autor') "
+                          "+ td.bibInfoData")
+    author = strip_ctrl(tag.get_text(" ", strip=True)) if tag else ""
+
+    return title, author
+
+# ─── quick “is this the same book?” guard  (DEBUG prints kept) ──────
+def _looks_like_same_book(want_title: str,
+                          want_author: str,
+                          record_url: str) -> bool:
+    """
+    True  ⇒ record_url is probably the same book
+    False ⇒ skip it
+
+    • author’s **surname** has to appear somewhere in the record
+    • ≥ 50 % of wanted-title tokens must overlap with the record title
+    """
+    rec_title, rec_author = _ester_fields(record_url)
+
+    # bail if we could not read anything useful
+    if not rec_title:
+        print(f"DEBUG: {want_title!r} — could not extract title → skip")
+        return False
+
+    rec_toks   = _tokenise(rec_title) | _tokenise(rec_author)
+    want_toks  = _tokenise(want_title)
+    surname    = _surname(want_author)
+
+    if surname and surname not in rec_toks:
+        print(f"DEBUG: {want_title!r} vs {rec_title!r} → skip "
+              f"(surname {surname!r} not found)")
+        return False
+
+    overlap = len(want_toks & rec_toks)
+    ok = overlap >= max(1, len(want_toks) // 2)
+
+    print(f"DEBUG: {want_title!r} vs {rec_title!r} → "
+          f"{'match' if ok else 'skip'} (overlap {overlap}/{len(want_toks)})")
+    return ok
 
 # ─── HTTP ────────────────────────────────────────────────────────────
 SESSION = requests.Session()
@@ -170,30 +278,65 @@ def _is_eresource(rec_url: str) -> bool:
     return ("võrguteavik" in page) or ("e-ressursid" in page)
 
 # ─── tiny helper: grab ESTER’s own <h1>/<h2 class="title"> ────────────
-def _ester_title(record_url: str) -> str:                    # ★ NEW
+def _ester_title(url: str,
+                 *, _seen: set[str] | None = None,
+                 _depth: int = 0,
+                 _max_depth: int = 4) -> str:
+    """
+    Return the display title for one `/record=b…` page.
+
+    Works with:
+      • the new single-page UI  (has <h1|h2 class="title">)
+      • the old MARC view       (title sits in <td id="bibTitle">  *or*
+                                 next to label “Pealkiri”)
+      • the legacy frameset UI  (title buried in the *second* frame)
+    Falls back to the URL if nothing useful can be extracted.
+    """
+    if _seen is None:
+        _seen = set()
+    if url in _seen or _depth >= _max_depth:
+        return url               # prevent loops
+
+    _seen.add(url)
     try:
-        soup = BeautifulSoup(_download(record_url), "html.parser")
-        tag  = soup.select_one("h1.title, h2.title")
-        return strip_ctrl(tag.get_text(strip=True)) if tag else record_url
+        html = _download(url)
     except Exception:
-        return record_url
+        return url
 
-# ─── universal record-finder (first link only) ───────────────────────
-def _extract_record_links(page_html: str) -> list[str]:
-    soup = BeautifulSoup(page_html, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
 
-    # ❶  Normal case – real record URLs:
-    recs = [urllib.parse.urljoin(ESTER, a["href"])
-            for a in soup.select("a[href*='/record=b']")]
-    if recs:
-        return recs
+    # ❶ modern UI ─────
+    tag = soup.select_one("h1.title, h2.title")
+    if tag and tag.get_text(strip=True):
+        return strip_ctrl(tag.get_text(strip=True))
 
-    # ❷  Fallback – search-results pages that point to *framesets*
-    #     (first hit is always inside an <h2 class="title"> …):
-    fs = [urllib.parse.urljoin(ESTER, a["href"])
-          for a in soup.select("h2.title > a[href*='frameset']")]
-    return fs          # may be empty – caller will deal with it
+    # ❷ old MARC view ─
+    #    a) direct <td id="bibTitle">
+    tag = soup.select_one("td#bibTitle")
+    if tag and tag.get_text(strip=True):
+        return strip_ctrl(tag.get_text(strip=True))
 
+    #    b) generic two-column layout  (“Pealkiri” / title)
+    for row in soup.select("tr"):
+        lbl = row.select_one("td.bibInfoLabel")
+        dat = row.select_one("td.bibInfoData")
+        if lbl and dat and "pealkiri" in lbl.get_text(strip=True).lower():
+            txt = dat.get_text(strip=True)
+            if txt:
+                return strip_ctrl(txt)
+
+    # ❸ frameset ──────
+    for fr in soup.find_all(["frame", "iframe"], src=True):
+        child = urllib.parse.urljoin(url, fr["src"])
+        got = _ester_title(child,
+                           _seen=_seen,
+                           _depth=_depth + 1,
+                           _max_depth=_max_depth)
+        if not got.startswith(("http://", "https://")):  # success
+            return got
+
+    # ❹ hopeless ──────
+    return url
 
 def _first_candidate_link(html: str, base: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
@@ -257,19 +400,21 @@ def process_title(idx: int, total: int, author: str, title: str, isbn: str):
     local_copies: Counter = Counter()
     local_meta: Dict[str, Tuple[str, str]] = {}
 
-    for rec in search(author, title, isbn):
-        # we already filtered out e-resources upstream, so just take it
-        log("📖 ESTER", rec, "dim")
+    # --- grab ONLY the top-ranked record ---------------------------------
+    candidates = search(author, title, isbn)
+    first = candidates[0] if candidates else None
 
-        kohals = holdings(rec)        # may be an empty list
-        for loc in kohals:
-            name, addr = resolve(loc)
-            key = f"{name}|{addr}"
-            local_copies[(author, title, key)] += 1
-            local_meta[key] = (name, addr)
+    if first and _looks_like_same_book(title, author, first):
+        kohals = holdings(first)          # ← fetch once
+        log("📖 ESTER", first, "dim")
 
-        # whatever the KOHAL count is, we stop after the first record
-        break
+        if kohals:                        # some copies available
+            for loc in kohals:
+                name, addr = resolve(loc)
+                key = f"{name}|{addr}"
+                local_copies[(author, title, key)] += 1
+                local_meta[key] = (name, addr)
+    # ---------------------------------------------------------------------
 
     total_kohal = sum(local_copies.values())
     if total_kohal:
@@ -280,6 +425,11 @@ def process_title(idx: int, total: int, author: str, title: str, isbn: str):
                       + (f"  (ISBN {isbn})" if isbn else ""))
 
     log("⏳", f"{time.time() - t0:.2f}s", "pur")
+
+    if DEBUG:
+        for (a_, t_, key_), n_ in local_copies.items():
+            log("DBG-copy", f"{key_:50}  +{n_}", "yel")
+
     return local_copies, local_meta
 
 # ─── query builders --------------------------------------------------
@@ -378,19 +528,35 @@ def gc_save(c):
     GEOCACHE.write_text(json.dumps(c, indent=2, ensure_ascii=False))
 
 def geocode(key, addr, geo, cache, force):
-    if not addr: return None
-    if not force and key in cache: return tuple(cache[key])
-    loc = geo(addr); time.sleep(1)
+    if not addr:
+        return None
+
+    # already cached
+    if not force and key in cache:
+        if DEBUG:
+            log("DBG-geo", f"cache {key:<45} → {cache[key]}", "dim")
+        return tuple(cache[key])
+
+    loc = geo(addr)            # Nominatim look-up (rate-limited)
+    time.sleep(1)
+
     if loc:
-        cache[key] = (loc.latitude, loc.longitude); gc_save(cache)
+        cache[key] = (loc.latitude, loc.longitude)
+        gc_save(cache)
+        if DEBUG:
+            log("DBG-geo", f"fresh {key:<45} → {(loc.latitude, loc.longitude)}", "grn")
         return loc.latitude, loc.longitude
-    log("!", f"geocode FAIL {addr}", "yel", err=True)
+
+    log("!", f"geocode FAIL {addr}", "red", err=True)
     return None
 
 def pcol(n: int) -> str:
-    if n == 1: return "red"
-    if n <= 3: return "orange"
-    if n <= 7: return "yellow"
+    if n == 1:
+        return "red"
+    if n <= 3:
+        return "orange"
+    if n <= 7:
+        return "beige"     # was 'yellow' → not accepted by folium.Icon
     return "green"
 
 def build_map(lib_books, meta, coords, outfile):
