@@ -66,7 +66,15 @@ SEARCH          = f"{ESTER}/search~S8*est"
 GEOCACHE  = pathlib.Path(".geocache.json")
 CITY_BOX  = 0.3
 CITY_ZOOM = 12
-POPUP_CSS = "font-size:2em;"
+# ── at the top of the file ──────────────────────────
+POPUP_CSS = (
+    "font-size:1em;"
+    "max-width:1000px;"
+    "max-height:400px;"
+    "overflow:auto;"
+    "white-space:nowrap;"
+)
+
 
 _DASH = re.compile(r"[\u2010-\u2015\u2212]")
 _SLUG = re.compile(r"[^A-Z0-9]")
@@ -222,6 +230,7 @@ def _ester_fields(record_url: str) -> tuple[str, str]:
     return title, author
 
 # ─── quick “is this the same book?” guard  (DEBUG prints kept) ──────
+# ─── quick “is this the same book?” guard  (DEBUG prints kept) ──────
 def _looks_like_same_book(want_title: str,
                           want_author: str,
                           record_url: str) -> bool:
@@ -232,28 +241,36 @@ def _looks_like_same_book(want_title: str,
     • author’s **surname** has to appear somewhere in the record
     • ≥ 50 % of wanted-title tokens must overlap with the record title
     """
+    # 1) ignore “( … )” trailers such as series info or part numbers
+    want_title = strip_parens(want_title)
+
+    # 2) pull both title *and* author line from the ESTER record page
     rec_title, rec_author = _ester_fields(record_url)
 
     # bail if we could not read anything useful
     if not rec_title:
-        print(f"DEBUG: {want_title!r} — could not extract title → skip")
+        print(f"{want_title!r} — could not extract title → skip")
         return False
 
+    # 3) tokenise: ASCII-fold, lower-case, strip punctuation
     rec_toks   = _tokenise(rec_title) | _tokenise(rec_author)
     want_toks  = _tokenise(want_title)
     surname    = _surname(want_author)
 
+    # 4) author surname must be present
     if surname and surname not in rec_toks:
-        print(f"DEBUG: {want_title!r} vs {rec_title!r} → skip "
+        print(f"{want_title!r} vs {rec_title!r} → skip "
               f"(surname {surname!r} not found)")
         return False
 
+    # 5) at least half the title tokens must overlap
     overlap = len(want_toks & rec_toks)
     ok = overlap >= max(1, len(want_toks) // 2)
 
-    print(f"DEBUG: {want_title!r} vs {rec_title!r} → "
+    print(f"{want_title!r} vs {rec_title!r} → "
           f"{'match' if ok else 'skip'} (overlap {overlap}/{len(want_toks)})")
     return ok
+
 
 # ─── HTTP ────────────────────────────────────────────────────────────
 SESSION = requests.Session()
@@ -560,23 +577,58 @@ def pcol(n: int) -> str:
     return "green"
 
 def build_map(lib_books, meta, coords, outfile):
+    """
+    lib_books   { key → [ "Author – Title", … ] }
+    meta        { key → (nice_name, address) }
+    coords      { key → (lat, lon) }
+    outfile     output .html file
+    """
     if not coords:
-        log("!", "Nothing available (KOHAL) on ESTER", "yel", err=True); return
+        log("!", "Nothing available (KOHAL) on ESTER", "yel", err=True)
+        return
+
+    # centre map on mean lat / lon
     lats = [la for la, _ in coords.values()]
     lons = [lo for _, lo in coords.values()]
-    zoom = CITY_ZOOM if max(lats)-min(lats) < CITY_BOX and max(lons)-min(lons) < CITY_BOX else 7
-    m = folium.Map(location=[sum(lats)/len(lats), sum(lons)/len(lons)], zoom_start=zoom)
+    centre = (sum(lats) / len(lats), sum(lons) / len(lons))
+
+    m = folium.Map(location=centre, zoom_start=11)
+
+    # override Leaflet’s default 300 px CSS limit
+    folium.Element(
+        "<style>.leaflet-popup-content{max-width:1600px;}</style>"
+    ).add_to(m)
+
     for key, books in lib_books.items():
-        if key not in coords: continue
-        lat, lon = coords[key]; name, _ = meta[key]
-        html_popup = (f"<div style='{POPUP_CSS}'><b>{htm.escape(name)}</b><ul>"
-                      + "".join(f"<li>{htm.escape(b)}</li>" for b in books)
-                      + "</ul></div>")
-        folium.Marker([lat, lon],
-                      popup=folium.Popup(html_popup, max_width=350),
-                      icon=folium.Icon(color=pcol(len(books)), icon="book", prefix="fa")
-                     ).add_to(m)
-    m.save(outfile); log("✓", f"[Done] {outfile}", "grn")
+        if key not in coords:
+            continue            # should not happen, but be safe
+
+        lat, lon = coords[key]
+        name, _  = meta[key]
+
+        html_popup = (
+            f"<div style='{POPUP_CSS}'>"
+            f"<b>{htm.escape(name)}</b><ul>"
+            + "".join(f"<li>{htm.escape(b)}</li>" for b in books)
+            + "</ul></div>"
+        )
+
+        folium.Marker(
+            location=[lat, lon],
+            popup=folium.Popup(
+                html_popup,
+                max_width=1600,     # ← widen the bubble
+                min_width=300       #   and keep it from shrinking too much
+            ),
+            icon=folium.Icon(
+                color=pcol(len(books)),
+                icon="book",
+                prefix="fa"
+            ),
+        ).add_to(m)
+
+    m.save(outfile)
+    log("✓", f"[Done] {outfile}", "grn")
 
 # ─── main CLI --------------------------------------------------------
 def main():
