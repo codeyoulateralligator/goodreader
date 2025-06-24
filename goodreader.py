@@ -71,7 +71,7 @@ GEOCACHE = pathlib.Path(".geocache.json")
 CITY_BOX = 0.3
 CITY_ZOOM = 12
 POPUP_CSS = (
-    "font-size:1em;"
+    "font-size:1.5em;"
     "max-width:1000px;"
     "max-height:400px;"
     "overflow:auto;"
