@@ -347,10 +347,12 @@ def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
         with open("debug_empty_holdings.html", "w", encoding="utf-8") as fh:
             fh.write(html[:1200])            # write only first 1 200 B
 
+    N = 2                             # how many rows to dump verbosely
     if DEBUG and out:
-        _dbg_pair("holdings", out[0])       # show first row
-        if len(out) > 1:
-            _dbg_pair("holdings", out[1])
+        for loc, sta in out[:N]:
+            _dbg_pair("holdings", (loc, sta))
+        if len(out) > N:
+            dbg("holdings", f"... (+{len(out) - N} more)")
 
     return out
 
