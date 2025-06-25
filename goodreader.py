@@ -7,7 +7,7 @@ Build b-32 • 2025-07-02
 from __future__ import annotations
 # ── stdlib ───────────────────────────────────────────────────────────
 import argparse, csv, json, os, pathlib, re, sys, time, unicodedata, urllib.parse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque   
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 # ── third-party ──────────────────────────────────────────────────────
@@ -17,8 +17,6 @@ from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from requests.exceptions import ReadTimeout
 import hashlib
-from html import unescape
-
 
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
@@ -28,8 +26,9 @@ _WHITES = re.compile(r"\s{2,}")
 def log(tag, msg, col="dim", err=False):
     stream = sys.stderr if err or DEBUG else sys.stdout
     print(f"{CLR[col]}{tag}{CLR['reset']} {msg}", file=stream, flush=True)
-def dbg(msg):                          # very verbose HTTP trace
-    if DEBUG: log("•", msg, "red")
+def dbg(tag, msg="", col="red"):
+    if DEBUG:
+        log(tag, msg, col)
 
 FAILED: List[str] = []                 # titles with zero *KOHAL*
 HTML_CACHE: dict[str, str] = {}
@@ -121,25 +120,109 @@ def gd_csv(path: pathlib.Path, limit: int | None):
             if limit and len(out)>=limit: break
     return out
 
+_isbn13_re = re.compile(r"\b\d{13}\b")
+
+def _last_isbn13(s: str) -> str:
+    """Return the *last* 13-digit sequence in *s* (or '')."""
+    all_hits = _isbn13_re.findall(s)
+    return all_hits[-1] if all_hits else ""
+
 # ─── Goodreads web-shelf scraper (public profile) ────────────────────
-def parse_web_shelf(uid:str, limit:int|None):
-    out=[]; page=1
+def parse_web_shelf(uid: str, limit: int | None):
+    """
+    Scrape the public “table view” of a Goodreads user’s To-Read shelf.
+
+    The ISBN column renders as:
+        <span class="greyText">13</span>9789916127209
+    so we MUST pick the *last* 13-digit substring.
+    """
+    out, page = [], 1
     while True:
-        url=(f"{GOODREADS_SHELF}/{uid}?shelf=to-read&per_page=200&page={page}"
-             "&sort=date_added&view=table")
-        soup=BeautifulSoup(_download(url),"html.parser")
-        rows=soup.select("tr[id^='review_']")
-        if not rows: break
+        url = (f"{GOODREADS_SHELF}/{uid}"
+               "?shelf=to-read&per_page=200"
+               f"&page={page}&sort=date_added&view=table")
+        soup = BeautifulSoup(_download(url), "html.parser")
+
+        rows = soup.select("tr[id^='review_']")
+        if not rows:
+            break
+
         for r in rows:
-            a=r.select_one("td.field.author a")
-            t=r.select_one("td.field.title a")
-            raw=(r.select_one("td.field.isbn13") or "").get_text(strip=True)
-            m=re.search(r"(\d{13})",raw); isbn=m.group(1) if m else ""
-            if a and t: out.append((a.get_text(strip=True),t.get_text(strip=True),isbn))
-            if limit and len(out)>=limit: return out
-        if soup.select_one("a:-soup-contains('next »')"): page+=1
-        else: break
+            a = r.select_one("td.field.author   a")
+            t = r.select_one("td.field.title    a")
+            raw = r.select_one("td.field.isbn13")
+            # take the LAST 13-digit run, ignore leading “13” label
+            digits = re.findall(r"\b\d{13}\b", raw.get_text()) if raw else []
+            isbn   = digits[-1] if digits else ""
+            if a and t:
+                out.append((a.get_text(strip=True),
+                            t.get_text(strip=True),
+                            isbn))
+            if limit and len(out) >= limit:
+                return out
+        page += 1
     return out
+
+# ─── Smarter hit-list crawler  ───────────────────────────────────────
+# ─── collect_record_links – final fix ────────────────────────────────
+def collect_record_links(start_url: str) -> list[str]:
+    """
+    Crawl an ESTER hit-list (of any flavour) and return **the first physical
+    /record=b… URL**.  Strategy:
+
+    1.  Breadth-first walk starting from *start_url*.
+        • follow <a href="…frameset…">, <a href="…frameset&FF=…">,
+          <frame src="…"> and <iframe src="…">.
+    2.  Every time we bump into <a href="/record=b…">:
+        • if the record is physical  → return it immediately;
+        • if it’s an e-resource      → ignore and keep crawling.
+    3.  When the queue is empty → return []  (nothing printable).
+
+    This **never bails out just because it saw a /record=b link** – it
+    bails only when it sees a *physical* one.
+    """
+    queue: deque[str] = deque([start_url])
+    seen:  set[str]   = set()
+
+    while queue:
+        url = queue.popleft()
+        if url in seen:
+            continue
+        seen.add(url)
+
+        dbg("collect open", url)
+        html = _download(url)
+        soup = BeautifulSoup(html, "html.parser")
+
+        # ------------------------------------------------------------------
+        # 1. Any record links in this document?
+        # ------------------------------------------------------------------
+        for a in soup.select('a[href*="/record=b"]'):
+            rec = urllib.parse.urljoin(url, a["href"])
+            if _is_eresource(rec):
+                dbg("collect", f"    skip E-RES {rec[-28:]}")
+                continue           # keep looking
+            dbg("collect", f"    ✓ physical {rec[-28:]}")
+            return [rec]          # ←────── success
+
+        # ------------------------------------------------------------------
+        # 2. Enqueue *every* inner document we can think of
+        # ------------------------------------------------------------------
+        leads = (
+            [u["href"] for u in soup.select('a[href*="/frameset"]')] +
+            [u["src"]  for u in soup.select('frame[src], iframe[src]')]
+        )
+        new_leads = [
+            urllib.parse.urljoin(url, l) for l in leads
+            if l and urllib.parse.urljoin(url, l) not in seen
+        ]
+        if new_leads:
+            dbg("collect", f"    add {len(new_leads)} leads")
+            queue.extend(new_leads)
+
+    # queue exhausted – no physical record anywhere in this hit list
+    dbg("collect", "    ∅ no physical copies")
+    return []
 
 # ─── tokenisers / surname helper ─────────────────────────────────────
 _norm_re=re.compile(r"[^a-z0-9]+")
@@ -169,24 +252,18 @@ def _ester_fields(rec):
     return (strip_ctrl(ttl.get_text(" ",strip=True)) if ttl else "",
             strip_ctrl(aut.get_text(" ",strip=True)) if aut else "")
 
-def _is_eresource(rec):
-    page=_download(rec).lower()
-    return any(w in page for w in ("võrguteavik","võrguressurss","veebiteavik","e-ressursid"))
+_ERS_TAGS = (
+    "1 võrguressurss",   # ESTER description for an online item
+    "tekstifail",        # EPub / PDF etc.
+    "audiofile", "videosalvestis",
+)
 
-def _first_candidate_link(html,base):
-    soup=BeautifulSoup(html,"html.parser")
-    a=soup.select_one("a[href*='/record=b']") or soup.select_one("h2.title > a[href*='frameset']")
-    return urllib.parse.urljoin(base,a["href"]) if a else None
-
-def collect_record_links(url):
-    html=_download(url); cand=_first_candidate_link(html,url)
-    if not cand: return []
-    if "frameset" in cand:
-        cand=_first_candidate_link(_download(cand),cand) or cand
-    if _is_eresource(cand):
-        nxt=BeautifulSoup(html,"html.parser").select("a[href*='/record=b']")
-        if len(nxt)>1: cand=urllib.parse.urljoin(url,nxt[1]["href"])
-    return [cand]
+def _is_eresource(rec_url: str) -> bool:
+    page = _download(rec_url).lower()
+    dbg("Downloaded page", f"{rec_url} → {len(page):,} B")
+    is_ere = any(tag in page for tag in _ERS_TAGS)
+    dbg(f"is_eresource: {rec_url} → {is_ere}")
+    return is_ere
 
 def _looks_like_same_book(w_ttl,w_aut,rec):
     w_ttl=strip_parens(w_ttl); r_ttl,r_aut=_ester_fields(rec)
@@ -198,31 +275,103 @@ def _looks_like_same_book(w_ttl,w_aut,rec):
     status = f"{color}{'match' if ok else 'skip'}\x1b[0m"
     print(f"\x1b[37m{w_ttl!r} vs {r_ttl!r} → {status}\x1b[0m")
     return ok
+# ──────────────────────────────────────────────────────────────────────
+# Helper: pretty-print one (loc, status) pair
+def _dbg_pair(tag: str, pair: tuple[str, str]):
+    loc, sta = pair
+    dbg(tag, f"{loc[:38]:38} {sta}")
 
-def holdings(rec):
-    m = re.search(r"\b(b\d{7})", rec)
-    if not m:
-        return []
+# ──────────────────────────────────────────────────────────────────────
+# ❶  Scrape one HTML holdings page
+def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
+    dbg("holdings", f"HTML→ {url}")
+    html   = _download(url)
+    dbg("holdings", f"      {len(html):,} B fetched")
 
-    bib  = m.group(1)
-    soup = BeautifulSoup(
-        _download(f"{ESTER}/search~S8*est?/.{bib}/.{bib}/1,1,1,B/"
-                  f"holdings~{bib}&FF=&1,0,/indexsort=-"),
-        "html.parser"
-    )
-
-    rows = soup.select("#tab-copies tr[class*='bibItemsEntry'], "
-                       ".additionalCopies tr[class*='bibItemsEntry']")
-
-    out = []
+    soup   = BeautifulSoup(html, "html.parser")
+    rows   = soup.select("#tab-copies tr[class*='bibItemsEntry'], "
+                         ".additionalCopies tr[class*='bibItemsEntry']")
+    out: list[tuple[str, str]] = []
     for r in rows:
         tds = r.find_all("td")
-        if len(tds) < 3:
-            continue
-        loc    = strip_ctrl(tds[0].get_text()).strip()
-        status = strip_ctrl(tds[2].get_text()).strip().upper()
-        out.append((loc, status))        # ← return BOTH columns
+        if len(tds) >= 3:
+            out.append((strip_ctrl(tds[0].get_text()).strip(),
+                        strip_ctrl(tds[2].get_text()).strip().upper()))
+
+    dbg("holdings", f"      {len(out)} rows matched selector")
+    if DEBUG and not out:
+        dbg("holdings", "      saving HTML preview")
+        with open("debug_empty_holdings.html", "w", encoding="utf-8") as fh:
+            fh.write(html[:1200])            # write only first 1 200 B
+
+    if DEBUG and out:
+        _dbg_pair("holdings", out[0])       # show first row
+        if len(out) > 1:
+            _dbg_pair("holdings", out[1])
+
     return out
+
+# ──────────────────────────────────────────────────────────────────────
+# ❷  Ask EPiK JSON endpoint
+def _copies_via_api(bib: str) -> list[tuple[str, str]]:
+    api = "https://epik.ester.ee/api/data/getItemsByCodeList"
+    dbg("holdings", f"API→ {api}  payload=[{bib!r}]")
+    try:
+        r = requests.post(api, json=[bib], timeout=10)
+        dbg("holdings", f"      HTTP {r.status_code}, {len(r.content):,} B")
+        r.raise_for_status()
+        data = r.json()[0]            # list with one element
+    except Exception as e:
+        dbg("holdings", f"API error: {e}")
+        return []
+
+    items = data.get("items", [])
+    dbg("holdings", f"      {len(items)} item objects")
+
+    out: list[tuple[str, str]] = []
+    for it in items:
+        loc = it.get("libraryNameEst") or it.get("libraryName") or ""
+        sta = (it.get("statusEst") or it.get("status") or "").upper()
+        out.append((strip_ctrl(loc), strip_ctrl(sta)))
+
+    if DEBUG and out:
+        _dbg_pair("holdings", out[0])
+        if len(out) > 1:
+            _dbg_pair("holdings", out[1])
+
+    return out
+
+# ──────────────────────────────────────────────────────────────────────
+# ❸  Master helper
+def holdings(rec: str) -> list[tuple[str, str]]:
+    """
+    ① fetch …/holdings~   → parse
+    ② fetch …/holdingsa~  → parse
+    ③ EPiK JSON API       → parse
+    returns [(location, STATUS), …]
+    """
+    m = re.search(r"\b(b\d{7})", rec)
+    if not m:
+        dbg("holdings", "cannot find bib-id in record URL")
+        return []
+    bib = m.group(1)
+
+    # -- step ① : classic ---------------------------------------------
+    base = (f"{ESTER}/search~S8*est?/.{bib}/.{bib}/1,1,1,B/holdings~{bib}"
+            "&FF=&1,0,/indexsort=-")
+    rows = _scrape_holdings_html(base)
+    if rows:
+        return rows
+
+    # -- step ② : “available copies” page ------------------------------
+    alt  = base.replace("holdings~", "holdingsa~")
+    rows = _scrape_holdings_html(alt)
+    if rows:
+        return rows
+
+    # -- step ③ : EPiK JSON -------------------------------------------
+    dbg("holdings", "HTML empty – switching to EPiK API")
+    return _copies_via_api(bib)
 
 def resolve(loc):
     if loc.startswith("TlnRK"):
@@ -484,32 +633,49 @@ def _record_brief(rec, fallback_title: str = "", isbn: str = "") -> str:
 
 _JS_SNIPPET = """
 <script>
-/* turn "&lt;br&gt;" etc. back into real tags */
+/* turn “&lt;br&gt;” etc. back into real tags */
 function decodeHTML(str){
-  const t   = document.createElement('textarea');
+  const t = document.createElement('textarea');
   t.innerHTML = str;
   return t.value;
 }
 
-const chosen = new Map();
+const chosen      = new Map();
+const headingHTML = '<button id="closeSel" onclick="clearSelection()" '
+                  + 'style="float:right;font-weight:bold;background:#eee;'
+                  + 'border:1px solid #999;border-radius:3px;width:1.6em;'
+                  + 'height:1.6em;line-height:1.2em;cursor:pointer;">&times;</button>'
+                  + '<h3 style="margin:0;">Valitud raamatud</h3>';
+
+function clearSelection(){
+  /* remove boldface from every previously chosen <li> */
+  for (const id of chosen.keys()){
+    const li = document.getElementById(id);
+    if (li) li.style.fontWeight = "normal";
+  }
+  chosen.clear();
+
+  /* reset panel to just the heading + close button */
+  document.getElementById("selectionBox").innerHTML = headingHTML;
+}
 
 function toggleBook(id){
   const li    = document.getElementById(id);
   const panel = document.getElementById("selectionBox");
 
-  if(chosen.has(id)){
+  if (chosen.has(id)){
     chosen.delete(id);
     li.style.fontWeight = "normal";
-  }else{
+  } else {
     chosen.set(id, decodeHTML(li.dataset.brief));
     li.style.fontWeight = "bold";
   }
 
   panel.innerHTML =
-  "<h3>Valitud raamatud</h3>" +
-  Array.from(chosen.values())
-    .map(txt => "<p>" + txt + "</p>")
-    .join("<hr style='margin:.4em 0;'>");
+      headingHTML +
+      Array.from(chosen.values())
+           .map(txt => "<p>"+txt+"</p>")
+           .join("<hr style=\'margin:.4em 0; display:block; width:100%;\'>");
 }
 </script>
 
@@ -521,16 +687,34 @@ function toggleBook(id){
   box-shadow:0 0 8px rgba(0,0,0,.3); font-size:0.9em;
 }
 </style>
-<div id="selectionBox"><h3>Valitud raamatud</h3></div>
+
+<!-- initial empty panel -->
+<div id="selectionBox">
+  <button id="closeSel" onclick="clearSelection()" 
+          style="float:right;font-weight:bold;background:#eee;border:1px solid #999;
+                 border-radius:3px;width:1.6em;height:1.6em;line-height:1.2em;
+                 cursor:pointer;">&times;</button>
+  <h3 style="margin:0;">Valitud raamatud</h3>
+</div>
 """
 
 # ─── search helpers ──────────────────────────────────────────────────
-def _probe(label,url):
-    links=collect_record_links(url); hits=len(links)
-    log("🛰 probe",f"{label:<11} {hits} hit(s)","grn" if hits else "red")
-    if not hits: log("⋯",url,"dim")
+def _probe(label: str, url: str) -> list[str]:
+    """
+    Run one ESTER probe, log hit-count *and* the probe-URL, then return
+    the list of record links found.
+    """
+    links = collect_record_links(url)
+    hits  = len(links)
+
+    colour = "grn" if hits else "red"
+    log("🛰 probe", f"{label:<11} {hits} hit(s)", colour)
+    log("↳", url, "dim")                     # always print the URL
+
     return links
-def by_isbn(isbn): return _probe("keyword-isbn",f"{SEARCH}/X?searchtype=X&searcharg={isbn}"
+
+def by_isbn(isbn): 
+    return _probe("keyword-isbn",f"{SEARCH}/X?searchtype=X&searcharg={isbn}"
                                                "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
 def by_title_index(t):
     q=ester_enc(norm_dash(t))
@@ -578,8 +762,8 @@ def process_title(idx,total,a,t,isbn):
 
                 meta[key] = (name, addr)
 
-                # NEW — echo every copy line to the console
-                dbg("•", f"{loc}\t{status}", "dim")
+                # # NEW — echo every copy line to the console
+                # dbg("•", f"{loc}\t{status}", "dim")
     tot=sum(copies.values())
     log("✓" if tot else "✗",f"{tot} × KOHAL" if tot else "0 × KOHAL",
         "grn" if tot else "red")
@@ -588,7 +772,6 @@ def process_title(idx,total,a,t,isbn):
     return copies,meta
 
 # ─── map builder ─────────────────────────────────────────────────────
-# ─── map builder ----------------------------------------------------
 def build_map(lib_books, meta, coords, outfile):
     """
     lib_books { key → [(display, url)  OR  display_string, …] }
