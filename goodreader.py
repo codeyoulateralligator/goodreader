@@ -200,19 +200,28 @@ def _looks_like_same_book(w_ttl,w_aut,rec):
     return ok
 
 def holdings(rec):
-    m=re.search(r"\b(b\d{7})",rec)
-    if not m: return []
-    bib=m.group(1)
-    soup=BeautifulSoup(_download(f"{ESTER}/search~S8*est?/.{bib}/.{bib}/1,1,1,B/"
-                                 f"holdings~{bib}&FF=&1,0,/indexsort=-"),"html.parser")
-    rows=soup.select("#tab-copies tr[class*='bibItemsEntry'], "
-                     ".additionalCopies tr[class*='bibItemsEntry']")
-    out=[]
+    m = re.search(r"\b(b\d{7})", rec)
+    if not m:
+        return []
+
+    bib  = m.group(1)
+    soup = BeautifulSoup(
+        _download(f"{ESTER}/search~S8*est?/.{bib}/.{bib}/1,1,1,B/"
+                  f"holdings~{bib}&FF=&1,0,/indexsort=-"),
+        "html.parser"
+    )
+
+    rows = soup.select("#tab-copies tr[class*='bibItemsEntry'], "
+                       ".additionalCopies tr[class*='bibItemsEntry']")
+
+    out = []
     for r in rows:
-        tds=r.find_all("td")
-        if len(tds)<3: continue
-        if "KOHAL" not in strip_ctrl(tds[2].get_text()).upper(): continue
-        out.append(strip_ctrl(tds[0].get_text()).strip())
+        tds = r.find_all("td")
+        if len(tds) < 3:
+            continue
+        loc    = strip_ctrl(tds[0].get_text()).strip()
+        status = strip_ctrl(tds[2].get_text()).strip().upper()
+        out.append((loc, status))        # ← return BOTH columns
     return out
 
 def resolve(loc):
@@ -458,17 +467,19 @@ def _record_brief(rec, fallback_title: str = "", isbn: str = "") -> str:
 
     cover_html = f'<img src="{cover}" style="height:120px;float:right;margin-left:.6em;">' if cover else ""
 
-    # --- 4. Compose & cache --------------------------------------------------
-    brief = (
-        f"{cover_html}"
-        f"{htm.escape(author)} – <em>{htm.escape(title)}</em>"
-        if author
-        else f"{cover_html}<em>{htm.escape(title)}</em>"
-    )
+    # ── 4. Compose & cache ────────────────────────────────
+    link_start = f'<a href="{htm.escape(url)}" target="_blank" rel="noopener noreferrer">' if url else ""
+    link_end   = '</a>' if url else ""
+
+    if author:
+        text  = f"{htm.escape(author)} – <em>{htm.escape(title)}</em>"
+    else:
+        text  = f"<em>{htm.escape(title)}</em>"
+
+    brief = f"{cover_html}{link_start}{text}{link_end}"
 
     if url:
         _BRIEF_CACHE[url] = brief
-
     return brief
 
 _JS_SNIPPET = """
@@ -495,10 +506,10 @@ function toggleBook(id){
   }
 
   panel.innerHTML =
-      "<h3>Valitud raamatud</h3>" +
-      Array.from(chosen.values())
-           .map(txt => "<p>"+txt+"</p>")
-           .join("");
+  "<h3>Valitud raamatud</h3>" +
+  Array.from(chosen.values())
+    .map(txt => "<p>" + txt + "</p>")
+    .join("<hr style='margin:.4em 0;'>");
 }
 </script>
 
@@ -557,9 +568,18 @@ def process_title(idx,total,a,t,isbn):
         RECORD_URL[(a,t)] = rec
         RECORD_ISBN[rec] = isbn or ""
         _record_brief(rec, f"{a} – {t}", isbn or "")
-        for loc in holdings(rec):
-            name,addr=resolve(loc); key=f"{name}|{addr}"
-            copies[(a,t,key)]+=1; meta[key]=(name,addr)
+        for loc, status in holdings(rec):
+                name, addr = resolve(loc)
+                key        = f"{name}|{addr}"
+
+                # availability count for the pin colour
+                if "KOHAL" in status:
+                    copies[(a, t, key)] += 1
+
+                meta[key] = (name, addr)
+
+                # NEW — echo every copy line to the console
+                dbg("•", f"{loc}\t{status}", "dim")
     tot=sum(copies.values())
     log("✓" if tot else "✗",f"{tot} × KOHAL" if tot else "0 × KOHAL",
         "grn" if tot else "red")
