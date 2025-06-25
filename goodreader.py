@@ -37,6 +37,8 @@ RECORD_BRIEF: dict[str, str] = {}
 RECORD_ISBN: dict[str, str] = {}       # record-url  →  isbn13
 _BRIEF_CACHE: dict[str, str] = {} 
 _ID_SEEN: set[str] = set()
+_SURNAME_IGNORE = {"de", "da", "di", "van", "von",
+                   "le", "la", "du", "del", "der"}
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -265,16 +267,57 @@ def _is_eresource(rec_url: str) -> bool:
     dbg(f"is_eresource: {rec_url} → {is_ere}")
     return is_ere
 
-def _looks_like_same_book(w_ttl,w_aut,rec):
-    w_ttl=strip_parens(w_ttl); r_ttl,r_aut=_ester_fields(rec)
-    if not r_ttl: return False
-    sur=_surname(w_aut)
-    ok=len((_tokenise(r_ttl)|_tokenise(r_aut)) & _tokenise(w_ttl)) >= max(1,len(_tokenise(w_ttl))//2)
-    if sur and sur not in (_tokenise(r_ttl)|_tokenise(r_aut)): ok=False
-    color = "\x1b[32m" if ok else "\x1b[31m"
-    status = f"{color}{'match' if ok else 'skip'}\x1b[0m"
-    print(f"\x1b[37m{w_ttl!r} vs {r_ttl!r} → {status}\x1b[0m")
-    return ok
+def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
+    """
+    Decide whether the ESTER record behind `rec_url` represents the same
+    book we’re looking for (`w_ttl`, `w_aut`).
+
+    Returns
+    -------
+    bool
+        True  → accept this record as a match
+        False → skip and keep searching
+    """
+    # ── 1. Fetch & parse the record page ─────────────────────────────
+    r_ttl, r_aut = _ester_fields(rec_url)            # helper already in file
+    if not r_ttl:                                    # page unreachable / parse fail
+        return False
+
+    # ── 2. Token-ise everything we’ll compare ───────────────────────
+    wanted_toks  = _tokenise(strip_parens(w_ttl))        # title from Goodreads
+    record_toks  = _tokenise(r_ttl) | _tokenise(r_aut)   # all tokens from ESTER
+    author_toks  = _tokenise(w_aut)                      # every word of wanted author
+
+    # ── 3. Title overlap test ───────────────────────────────────────
+    shared_toks = sorted(record_toks & wanted_toks)
+    title_ok    = len(shared_toks) >= max(1, len(wanted_toks) // 2)
+
+    # ── 4. Author overlap test (fixed) ──────────────────────────────
+    surname_raw   = _surname(w_aut)                     # e.g. 'saint-exupery'
+    surname_parts = _tokenise(surname_raw)              # {'saint', 'exupery'}
+    shared_auth   = sorted(record_toks & author_toks)
+    author_ok     = (not surname_parts) or surname_parts.issubset(record_toks)
+
+    # ── 5. DEBUG dump ───────────────────────────────────────────────
+    if DEBUG:
+        print("┌─  title/author comparator ──────────────────────────────────────")
+        print(f"│  record URL      : {rec_url}")
+        print(f"│  wanted ttl      : {w_ttl!r}")
+        print(f"│  record ttl      : {r_ttl!r}")
+        print(f"│  wanted aut      : {w_aut!r}")
+        print(f"│  record aut      : {r_aut!r}")
+        print(f"│  wanted toks     : {sorted(wanted_toks)}")
+        print(f"│  record toks     : {sorted(record_toks)}")
+        print(f"│  shared ttl toks : {shared_toks}  ({len(shared_toks)}/{len(wanted_toks)} match)")
+        print(f"│  author toks     : {shared_auth}  ({len(shared_auth)}/{len(author_toks)} match)")
+        print(f"│  surname parts   : {sorted(surname_parts)}")
+        print(f"│  all parts {'present' if author_ok else 'NOT present'} in record tokens")
+        verdict = "MATCH" if (title_ok and author_ok) else "SKIP"
+        colour  = "grn" if verdict == "MATCH" else "red"
+        print(f"└── verdict: {CLR[colour]}{verdict}{CLR['reset']}\n")
+
+    return title_ok and author_ok
+
 # ──────────────────────────────────────────────────────────────────────
 # Helper: pretty-print one (loc, status) pair
 def _dbg_pair(tag: str, pair: tuple[str, str]):
