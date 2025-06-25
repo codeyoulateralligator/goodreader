@@ -16,6 +16,9 @@ from bs4 import BeautifulSoup
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from requests.exceptions import ReadTimeout
+import hashlib
+from html import unescape
+
 
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
@@ -32,6 +35,9 @@ FAILED: List[str] = []                 # titles with zero *KOHAL*
 HTML_CACHE: dict[str, str] = {}
 RECORD_URL: dict[tuple[str, str], str] = {}
 RECORD_BRIEF: dict[str, str] = {}
+RECORD_ISBN: dict[str, str] = {}       # record-url  →  isbn13
+_BRIEF_CACHE: dict[str, str] = {} 
+_ID_SEEN: set[str] = set()
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -225,37 +231,245 @@ def pcol(n:int)->str:
     if n<=7: return "beige"
     return "green"
 
-# ─── id / brief helpers ──────────────────────────────────────────────
-_id_re=re.compile(r"\W+")
-def _safe_id(s): return _id_re.sub("",s)[:40] or "x"
-def _record_brief(url: str, fallback: str = "") -> str:
+def _safe_id(raw: str) -> str:
     """
-    Return a short HTML snippet for the book’s card.
-    • If the record page cannot be fetched (rate-limit, etc.),
-      fall back to *fallback* (plain text).
+    Convert *raw* into a stable, HTML- and CSS-safe id attribute.
+    - keep ASCII letters, numbers, '-' and '_'
+    - collapse other runs of chars into a single '-'
+    - guarantee uniqueness by appending a counter if needed
     """
+    # 1. slugify
+    slug = re.sub(r'[^0-9A-Za-z_-]+', '-', raw).strip('-_')
+    if not slug:                                           # pathological case
+        slug = 'id-' + hashlib.md5(raw.encode()).hexdigest()[:8]
+
+    # 2. ensure uniqueness
+    if slug in _ID_SEEN:
+        base, n = slug, 2
+        while f"{base}-{n}" in _ID_SEEN:
+            n += 1
+        slug = f"{base}-{n}"
+    _ID_SEEN.add(slug)
+    return slug
+
+# ----------------------------------------------------------------------
+# Low-level helper – talks to the hidden “avalanche” REST endpoint
+# ----------------------------------------------------------------------
+def _avalanche_cover(recnum: str, session: requests.Session | None = None) -> str:
+    """
+    Ask the avalanche micro-service for cover art of one ESTER record.
+
+    Parameters
+    ----------
+    recnum   ESTER record number, e.g. "b2404042".
+    session  optional requests.Session for connection reuse.
+
+    Returns
+    -------
+    The best image URL (or a data:-URI) or "" if not available.
+    """
+    api = "https://epik.ester.ee/ester/avalanche?ids"
+    sess = session or requests
+
     try:
-        html = _download(url)
-        soup = BeautifulSoup(html, "html.parser")
+        resp = sess.post(api, json=[recnum], timeout=10)
+        resp.raise_for_status()
+        meta = resp.json()[0]           # we asked for one record → list[0]
+        print(meta)
+        if meta.get("imageData"):       # base-64 payload
+            return f"data:image/jpeg;base64,{meta['imageData']}"
 
-        ttl = soup.select_one("h1.title, h2.title")
-        aut = soup.select_one(
-            "td.bibInfoLabel:-soup-contains('Autor') + td.bibInfoData")
-        pub = soup.select_one(
-            "td.bibInfoLabel:-soup-contains('Ilmunud') + td.bibInfoData")
+        return meta.get("urlLarge") or meta.get("urlSmall") or ""
+    except Exception:
+        # network problems, JSON errors, etc. – pretend nothing was found
+        return ""
+    
+_BAD_IMG_PAT = re.compile(r'(?i)(/screens/|spinner|transparent\.gif|\.svg$)')
+_GOOGLE      = "https://books.google.com/books/content?vid=ISBN{0}&printsec=frontcover&img=1&zoom=1"
+_OPENLIB     = "https://covers.openlibrary.org/b/isbn/{0}-M.jpg"
+IMG_ATTRS    = ("data-src", "data-original", "data-large", "data-iiif-high", "src")
 
-        parts = []
-        if ttl: parts.append(f"<b>{htm.escape(ttl.get_text(strip=True))}</b>")
-        if aut: parts.append(htm.escape(aut.get_text(strip=True)))
-        if pub: parts.append(htm.escape(pub.get_text(strip=True)))
+def _looks_like_jacket(src: str) -> bool:
+    return (
+        src
+        and (src.startswith(("http://", "https://", "/iiif/")) or src.startswith("data:image/"))
+        and not _BAD_IMG_PAT.search(src)
+    )
 
-        return "<br>".join(parts) + \
-               f'<br><a href="{url}" target="_blank">ESTER →</a>'
+def _abs(src: str) -> str:
+    return src if src.startswith(("http", "data:")) else f"{ESTER}{src}"
 
-    except Exception as ex:         # 429, network error, …
-        if DEBUG:
-            log("!", f"_record_brief fail {url} ({ex})", "yel", err=True)
-        return htm.escape(fallback or url)
+def _scrape_isbns(soup: BeautifulSoup) -> list[str]:
+    isbns = []
+    for a in soup.select('a[href*="isbn"]'):
+        m = re.search(r'\b\d{9}[\dXx]|\d{13}\b', a.get_text())
+        if m:
+            isbns.append(m.group(0))
+    return isbns
+
+def _first_good_url(urls: list[str]) -> str:
+    for u in urls:
+        dbg(f"Trying URL: {u}")
+        try:
+            # Cloudinary: HEAD → 404, but GET (no body) → 302 → 200
+            r = requests.get(u, stream=True, timeout=5, allow_redirects=True)
+            ct = r.headers.get("Content-Type", "")
+            dbg(f"GET {u} → {r.status_code} ({ct})")
+            if r.ok and ct.startswith("image"):
+                dbg(f"Selected image URL: {r.url}")
+                return r.url                       # r.url == final location
+        except Exception as e:
+            dbg(f"Exception for URL {u}: {e}")
+    dbg("No good image URL found.")
+    return ""
+
+def _via_search_thumb(code: str) -> str:
+    """Return the cover thumb that appears only in the search-results page."""
+    url = f"https://www.ester.ee/search~S8*est/X?searchtype=X&searcharg={code}"
+    print(f"search-thumb URL: {url}")
+
+    try:
+        soup = BeautifulSoup(requests.get(url, timeout=8).text, "html.parser")
+
+        img = soup.select_one("td.briefcitPhotos img[src]")
+        if not img:
+            print("search-thumb: no <img> found")
+            return ""
+
+        src = img["src"]
+        if not src.startswith(("http://", "https://")):
+            src = f"https://www.ester.ee{src}"     # make absolute
+
+        print(f"search-thumb candidate: {src}")
+        return src if _first_good_url([src]) else ""
+    except Exception as e:
+        print(f"search-thumb error: {e}")
+        return ""
+# ---------------------------------------------------------------------------
+
+def _find_cover(soup: BeautifulSoup) -> str:
+    # STEP 1 ─ look at what’s already in the HTML ---------------------------
+    for tag in soup.select("img, noscript img"):
+        for attr in IMG_ATTRS:
+            if (src := tag.get(attr) or "").strip() and _looks_like_jacket(src):
+                return _abs(src)
+
+    og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+    if og and _looks_like_jacket(og.get("content", "")):
+        return _abs(og["content"])
+
+    # STEP 2 ─ EPiK API (+ fallbacks) --------------------------------------
+    html = str(soup)
+    m = (
+        re.search(r'record=([b\d]+)', html)
+        or re.search(r'catalog/([b\d]+)', html)
+        or re.search(r'"code"\s*:\s*"([b\d]+)"', html)
+    )
+    if not m:
+        return ""
+
+    code = m.group(1)
+    api  = "https://epik.ester.ee/api/data/getImagesByCodeList"
+    try:
+        item = requests.post(api, json=[code], timeout=10).json()[0]
+    except Exception:
+        item = None
+
+    # 2a – inline base-64
+    if item and item.get("imageData"):
+        return "data:image/jpeg;base64," + item["imageData"]
+
+    # 2b – IIIF (try record-code *before* uuid)
+    iiif_code = f"https://www.ester.ee/iiif/2/{code}/full/500,/0/default.jpg"
+    if _first_good_url([iiif_code]):
+        return iiif_code      # ✅ works for list thumbs and often for full cover
+
+    # 2c – IIIF with UUID (rarely used nowadays)
+    uuid = item and item.get("idUuid")
+    if uuid:
+        iiif_uuid = f"https://epik.ester.ee/iiif/2/{uuid}/full/500,/0/default.jpg"
+        if _first_good_url([iiif_uuid]):
+            return iiif_uuid
+
+    # 2c – Google Books / Open Library by ISBN
+    isbn_urls = [
+        _GOOGLE.format(i) for i in _scrape_isbns(soup)
+    ] + [
+        _OPENLIB.format(i) for i in _scrape_isbns(soup)
+    ]
+    return _first_good_url(isbn_urls)
+
+
+def _record_brief(rec, fallback_title: str = "", isbn: str = "") -> str:
+    """
+    Build a one-liner HTML snippet for the map pop-up.
+
+    `rec` may be:
+        • BeautifulSoup Tag / Soup
+        • raw HTML string
+        • record URL (str)
+    """
+    # --- 1. Retrieve / parse -------------------------------------------------
+    soup: BeautifulSoup | None = None
+    url: str | None = None
+
+    if hasattr(rec, "select_one"):          # Tag / Soup
+        soup = rec if isinstance(rec, BeautifulSoup) else BeautifulSoup(str(rec), "html.parser")
+
+    elif isinstance(rec, str):
+        if rec.startswith("http"):          # a link – maybe cached already
+            url = rec
+            if url in _BRIEF_CACHE:
+                return _BRIEF_CACHE[url]
+
+            html = _download(url)
+            soup = BeautifulSoup(html, "html.parser")
+        else:                               # raw HTML
+            soup = BeautifulSoup(rec, "html.parser")
+
+    # --- 2. Extract bits -----------------------------------------------------
+    title = author = ""
+
+    if soup:
+        ttl_el = (
+            soup.select_one(".bibInfoData strong")
+            or soup.select_one("h1.title, h2.title, td#bibTitle")
+        )
+        aut_el = (
+            soup.select_one(".bibInfoData a[href*='/author']")
+            or soup.select_one("td.bibInfoLabel:-soup-contains('Autor')+td.bibInfoData")
+        )
+
+        title  = ttl_el.get_text(strip=True) if ttl_el else ""
+        author = aut_el.get_text(strip=True) if aut_el else ""
+
+    # graceful fall-backs
+    if not title:
+        # fallback_title is something like "Author – Title" → keep only title part
+        if " – " in fallback_title:
+            title = fallback_title.split(" – ", 1)[1]
+        else:
+            title = fallback_title or "—"
+
+    # --- 3. Cover hunt -------------------------------------------------------
+    cover = _find_cover(soup) if soup else ""
+    if not cover and isbn:
+        cover = _openlib_link(isbn, "M")    # OpenLibrary, if it exists
+
+    cover_html = f'<img src="{cover}" style="height:120px;float:right;margin-left:.6em;">' if cover else ""
+
+    # --- 4. Compose & cache --------------------------------------------------
+    brief = (
+        f"{cover_html}"
+        f"{htm.escape(author)} – <em>{htm.escape(title)}</em>"
+        if author
+        else f"{cover_html}<em>{htm.escape(title)}</em>"
+    )
+
+    if url:
+        _BRIEF_CACHE[url] = brief
+
+    return brief
 
 _JS_SNIPPET = """
 <script>
@@ -326,6 +540,13 @@ def search(a,t,isbn):
     return []
 
 # ─── worker ──────────────────────────────────────────────────────────
+def _openlib_link(isbn13: str, size: str = "M") -> str:
+    # size = S | M | L   – whatever you prefer
+    return (
+        f"https://covers.openlibrary.org/b/isbn/{isbn13}-{size}.jpg"
+        "?default=false"          # << *** key change  ***
+    )   
+
 def process_title(idx,total,a,t,isbn):
     t0=time.time()
     log(f"[{idx:3}/{total}]",f"{a} – {t}","cyan")
@@ -333,7 +554,9 @@ def process_title(idx,total,a,t,isbn):
     copies=Counter(); meta={}
     recs=search(a,t,isbn); rec=recs[0] if recs else None
     if rec and _looks_like_same_book(t,a,rec):
-        RECORD_URL[(a,t)]=rec; _record_brief(rec,f"{a} – {t}")
+        RECORD_URL[(a,t)] = rec
+        RECORD_ISBN[rec] = isbn or ""
+        _record_brief(rec, f"{a} – {t}", isbn or "")
         for loc in holdings(rec):
             name,addr=resolve(loc); key=f"{name}|{addr}"
             copies[(a,t,key)]+=1; meta[key]=(name,addr)
@@ -386,7 +609,7 @@ def build_map(lib_books, meta, coords, outfile):
 
             elem_id = _safe_id(name + disp)
 
-            brief_html = _record_brief(url, disp) if url else htm.escape(disp)
+            brief_html = _record_brief(url, disp, RECORD_ISBN.get(url, "")) if url else htm.escape(disp)
             # escape for HTML attribute (keep <br> etc. un-escaped)
             brief_attr = (brief_html.replace("&", "&amp;")
                                       .replace('"', "&quot;")
