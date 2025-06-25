@@ -37,8 +37,7 @@ RECORD_BRIEF: dict[str, str] = {}
 RECORD_ISBN: dict[str, str] = {}       # record-url  →  isbn13
 _BRIEF_CACHE: dict[str, str] = {} 
 _ID_SEEN: set[str] = set()
-_SURNAME_IGNORE = {"de", "da", "di", "van", "von",
-                   "le", "la", "du", "del", "der"}
+_SURNAME_CLEAN = re.compile(r"[^a-z0-9]+")
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -107,6 +106,36 @@ def ester_enc(s):  return "".join(ch if ord(ch) < 128 else f"{{u{ord(ch):04X}}}"
 def strip_ctrl(t): return "".join(ch for ch in t
                                   if unicodedata.category(ch)[0]!="C"
                                   and unicodedata.category(ch)!="Cf")
+
+def _ascii_fold(s: str) -> str:
+    """
+    Strip accents/diacritics and return lowercase plain-ASCII.
+    """
+    return (
+        unicodedata
+        .normalize("NFKD", s)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+
+def _surname(author: str) -> str:
+    """
+    Produce a sortable surname key.
+
+    • Accepts both  “Lastname, Firstname”  (Goodreads CSV)
+      and           “Firstname Lastname”   (occasional fallback).
+
+    • Returned key is ASCII-folded, lowercase, and stripped of
+      punctuation/diacritics, so “Saint-Exupéry” → “saintexupery”.
+    """
+    a = _ascii_fold(author)
+    if "," in a:                                   # standard “Last, First”
+        last = a.split(",", 1)[0]
+    else:                                          # “First Last …”
+        parts = _SURNAME_CLEAN.split(a)
+        last = parts[-1] if parts else a
+    return _SURNAME_CLEAN.sub("", last)            # purge leftovers
 
 # ─── Goodreads CSV loader ────────────────────────────────────────────
 def gd_csv(path: pathlib.Path, limit: int | None):
@@ -820,14 +849,14 @@ def process_title(idx,total,a,t,isbn):
 def build_map(lib_books, meta, coords, outfile):
     """
     lib_books { key → [(display, url)  OR  display_string, …] }
-    meta      { key → (nice_name, address) }
+    meta      { key → (pretty_name, address) }
     coords    { key → (lat, lon) }
     """
     if not coords:
         log("!", "Nothing available (KOHAL) on ESTER", "yel", err=True)
         return
 
-    # centre map on mean lat / lon
+    # ── centre the map roughly on the mean location ────────────────
     lats = [la for la, _ in coords.values()]
     lons = [lo for _, lo in coords.values()]
     centre = (sum(lats) / len(lats), sum(lons) / len(lons))
@@ -837,32 +866,41 @@ def build_map(lib_books, meta, coords, outfile):
         "<style>.leaflet-popup-content{max-width:1600px;}</style>"
     ).add_to(m)
 
-    # IMPORTANT: add JS/CSS into the document <head>,
-    # so the functions are visible from every popup
+    # include the JS/CSS for the “selection” side-panel
     m.get_root().html.add_child(folium.Element(_JS_SNIPPET))
 
+    # ── iterate every library that has copies ───────────────────────
     for key, entries in lib_books.items():
         if key not in coords:
             continue
         lat, lon = coords[key]
-        name, _  = meta[key]
+        lib_name, _addr = meta[key]
 
-        lis: list[str] = []
-        for entry in entries:
-            # accept either ("disp", url) tuples or bare strings
-            if isinstance(entry, (tuple, list)):
-                disp, url = entry[0], (entry[1] if len(entry) > 1 else "")
-            else:
-                disp, url = entry, ""
+        # ── NEW: sort list items by author surname (case-/accent-less) ──
+        def _sort_key(entry):
+            disp = entry[0] if isinstance(entry, (tuple, list)) else entry
+            author_part = disp.split("–", 1)[0].strip()      # “Lastname, Firstname”
+            return _surname(author_part)
 
-            elem_id = _safe_id(name + disp)
+        entries_sorted = sorted(entries, key=_sort_key)
 
-            brief_html = _record_brief(url, disp, RECORD_ISBN.get(url, "")) if url else htm.escape(disp)
-            # escape for HTML attribute (keep <br> etc. un-escaped)
-            brief_attr = (brief_html.replace("&", "&amp;")
-                                      .replace('"', "&quot;")
-                                      .replace("'", "&#39;"))
-
+        # ── build the <li> elements (unchanged except we use entries_sorted) ──
+        lis = []
+        for entry in entries_sorted:
+            disp, url = (
+                (entry[0], entry[1]) if isinstance(entry, (tuple, list))
+                else (entry, "")
+            )
+            elem_id = _safe_id(lib_name + disp)
+            brief_html = (
+                _record_brief(url, disp, RECORD_ISBN.get(url, ""))
+                if url else htm.escape(disp)
+            )
+            brief_attr = (
+                brief_html.replace("&", "&amp;")
+                          .replace('"', "&quot;")
+                          .replace("'", "&#39;")
+            )
             lis.append(
                 f'<li id="{elem_id}" data-brief="{brief_attr}" '
                 f'style="cursor:pointer;color:#06c;" '
@@ -872,23 +910,22 @@ def build_map(lib_books, meta, coords, outfile):
 
         html_popup = (
             f"<div style='{POPUP_CSS}'>"
-            f"<b>{htm.escape(name)}</b><ul>"
-            + "".join(lis) +
-            "</ul></div>"
+            f"<b>{htm.escape(lib_name)}</b> "
+            f"<span style='color:#666;font-size:90%;'>"
+            f"({len(entries_sorted)} pealkirja)</span>"
+            f"<ul>{''.join(lis)}</ul></div>"
         )
 
         folium.Marker(
             location=[lat, lon],
             popup=folium.Popup(html_popup, max_width=1600, min_width=300),
-            icon=folium.Icon(color=pcol(len(entries)), icon="book", prefix="fa"),
+            icon=folium.Icon(color=pcol(len(entries_sorted)),
+                             icon="book", prefix="fa"),
         ).add_to(m)
 
+    # ── write file ──────────────────────────────────────────────────
     m.save(outfile)
     log("✓", f"[Done] {outfile}", "grn")
-
-
-
-
 
 # ─── main entry-point ────────────────────────────────────────────────
 def main():
