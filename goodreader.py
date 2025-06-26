@@ -946,35 +946,44 @@ def by_keyword(a,t):
                                 "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
 def search(author: str, title: str, isbn: str) -> list[str]:
     """
-    Return **at most one** ESTER record URL – the first one that
-    convincingly matches *author* + *title*.
+    Return **at most one** ESTER record URL – the first one that fits.
 
-    The probes are tried in this order:
-      1. ISBN
-      2. title-index search
-      3. keyword “author title”
-      4. keyword “title”
+    Strategy
+    --------
+      1. ISBN (unique)             → accept immediately if a physical record is found
+      2. title-index search        → require title/author token match
+      3. keyword  “author title”   → ditto
+      4. keyword  “title”          → ditto
     """
+    # -- normalise ----------------------------------------------------
     title = strip_parens(title)
 
+    # -- ① ISBN probe -------------------------------------------------
+    if isbn:
+        links = by_isbn(isbn)
+        if links:
+            # The catalogue confirmed the ISBN and the record is physical
+            return links[:1]           # short-circuit – no extra checks
+
+    # -- ②–④ fallback probes -----------------------------------------
     probes = (
-        (by_isbn,       isbn),
         (by_title_index, title),
-        (by_keyword,    (author, title)),
-        (by_keyword,    ("", title)),
+        (by_keyword,      (author, title)),
+        (by_keyword,      ("", title)),
     )
 
     for fn, arg in probes:
-        if not arg:                                   # empty ISBN etc.
+        if not arg:                             # empty title etc.
             continue
 
         links = fn(*arg) if isinstance(arg, tuple) else fn(arg)
 
-        for rec in links:                             # evaluate on the fly
+        for rec in links:                       # validate on the fly
             if _looks_like_same_book(title, author, rec):
-                return [rec]                          # ← EARLY EXIT
+                return [rec]                    # first convincing hit
 
-    return []                                         # nothing matched
+    return []                                   # nothing matched
+
 
 # ─── worker ──────────────────────────────────────────────────────────
 def _openlib_link(isbn13: str, size: str = "M") -> str:
