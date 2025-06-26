@@ -197,44 +197,131 @@ def parse_web_shelf(uid: str, limit: int | None):
         page += 1
     return out
 
-# ─── Smarter hit-list crawler  ───────────────────────────────────────
+# ─── put this near the other helpers ──────────────────────────────
+def _canon_name(token: str) -> str:
+    """
+    Give a *lossy but stable* ASCII fingerprint for one surname token so that
+    the countless spellings of the same Slavic/Baltic name collapse to the
+    **same** string.
+
+    Example collapses
+    -----------------
+        Aleksijevitš  →  alexivich
+        Alexievits    →  alexivich
+        Alexievich    →  alexivich
+        Alexivich     →  alexivich   (already canonical)
+
+    Pipeline
+    --------
+      0. lower-case
+      1. digraph fixes that still carry diacritics   (tš→ch, dž→j, …)
+      2. ASCII-fold remaining diacritics/umlauts
+      3. cheap phonetic conflations                 (ks→x, hh→kh, j→y)
+      4. collapse   double letters
+      4½.   -vits / -ievits / -yevits   →   -vich
+      5. glide simplifications           yi/iy/ie/ye  →  i
+      6. drop trailing i/y glides
+      7. strip everything that is *not* a–z
+    """
+    # ── 0. lower-case ────────────────────────────────────────────────
+    s = token.lower()
+
+    # ── 1. digraphs with diacritics (before ASCII-fold!) ─────────────
+    s = (s.replace("tš", "ch")
+           .replace("dž", "j"))
+
+    # ── 2. ASCII-fold: map the few Estonian diacritics we meet ───────
+    _TR = str.maketrans({
+        "š": "sh", "ž": "zh",
+        "õ": "o",  "ä": "a",
+        "ö": "o",  "ü": "u",
+    })
+    s = s.translate(_TR)
+
+    # ── 3. coarse phonetic conflations ───────────────────────────────
+    s = (s.replace("ks", "x")      # Aleks → Alex
+           .replace("hh", "kh")
+           .replace("j", "y"))     # Иван → Ivan-y (й → y)
+
+    # ── 4. collapse runs of doubled letters ──────────────────────────
+    s = re.sub(r"(.)\1+", r"\1", s)
+
+    # ── 4½. *-vits / -ievits / -yevits* → *-vich*  (most common case) ─
+    s = re.sub(r"(?:[iey]?v)its$", "vich", s)
+
+    # ── 5. glide simplifications  (yi/iy/ie/ye → i) ──────────────────
+    #     This erases the e/ы difference responsible for
+    #     Alexievich   vs  Alexivich    &c.
+    s = (s.replace("yi", "i")
+           .replace("iy", "i")
+           .replace("ie", "i")
+           .replace("ye", "i"))
+
+    # ── 6. kill any leftover trailing i/y glide ──────────────────────
+    s = re.sub(r"[iy]+$", "", s)
+
+    # ── 7. allow only plain ASCII letters in the final key ───────────
+    s = re.sub(r"[^a-z]", "", s)
+
+    return s
+
+
+_FRSCRUB = re.compile(r"""
+     (?:&\d+(?:,\d+)*,?$)                 # tail like “…&1,1,” or “…&0,0,”
+   | (?:[&?](?:save|saved|clear_saves)=[^&]*)   # ?save=…, &saved=…, …
+""", re.I | re.X)
+
+# ─── replace the whole _canon() with the version below ───────────────
 def _canon(url: str) -> str:
     """
-    Drop query-string, chop “…/frameset…” tail, unquote %XX.
+    Normalise *hit-list* URLs so that cosmetic junk
+    (slice counters, “save” parameters) cannot generate
+    an infinite stream of “new” pages.
 
-    Example:
-        https://www.ester.ee/search…/frameset&FF=foo&save=bar
-        → https://www.ester.ee/search~S8*est
+    • If the link is a Sierra hit-list (contains “/frameset” anywhere)
+      – keep the meaningful part up to &FF=…
+      – strip trailing slice counters (&1,1, …) and the save/saved
+        noise ESTER appends each time you click.
+    • Otherwise drop the whole query string – ordinary pages don’t need it
+      for uniqueness.
     """
-    s    = _uparse.urlsplit(url)
-    path = _uparse.unquote(s.path)
-    if '/frameset' in path:
-        path = path.split('/frameset', 1)[0]
-    return _uparse.urlunsplit((s.scheme, s.netloc, path, '', ''))
+    s = _uparse.urlsplit(url)
+    path  = _uparse.unquote(s.path)
+    query = _uparse.unquote(s.query)
 
+    if "/frameset" in path or "/frameset" in query:
+        tail = f"{path}?{query}" if query else path
+        tail = _FRSCRUB.sub("", tail)                # ← NEW: scrub junk
+        return _uparse.urlunsplit((s.scheme, s.netloc, tail, "", ""))
+
+    # non-frameset: ignore ?params entirely
+    return _uparse.urlunsplit((s.scheme, s.netloc, path, "", ""))
 
 _MAX_VISITED = 60          # safety valve
 _BAD_LEADS = (
     "/clientredirect", "/patroninfo~", "/validate/patroninfo",
     "/requestmulti~",  "/mylistsmulti", "/logout",
-    "/frameset&save",  "/save_recid",   "/redirect=",
-    "?save_func=", "&save=", "&saved=", "&clear_saves=",
+
+    # “Save record” noise produced by Sierra/ESTER
+    "?save=",         #  ← NEW  (was only “&save=”)
+    "&save=",
+    "?saved=",        #  ← NEW
+    "&saved=",
+    "?clear_saves=",  #  ← NEW
+    "&clear_saves=",
+    "/frameset&save",     # old variant
+    "?save_func=",
 )
 
 def collect_record_links(start_url: str) -> list[str]:
     """
-    Breadth-first walk:
-
-      1. open *start_url*
-      2. follow every “…/frameset…” link, every <frame>, every <iframe>
-      3. whenever we see /record=b… :
-           • skip if virtual         → continue crawling
-           • keep if physical        → add to output (deduped)
-      4. stop when the queue is empty or we hit _MAX_VISITED pages
+    Breadth-first walk – **but return immediately after the
+    first physical record link is discovered.**
     """
-    q     : deque[str] = deque([start_url])
-    seen  : set[str]   = set()
-    phys  : list[str]  = []
+    q:    deque[str] = deque([start_url])
+    seen: set[str]   = set()
+
+    phys: list[str]  = []
 
     while q:
         url = q.popleft()
@@ -244,39 +331,42 @@ def collect_record_links(start_url: str) -> list[str]:
         seen.add(key)
 
         dbg("collect open", url)
-        html = _download(url)
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(_download(url), "html.parser")
 
-        # --- harvest record links on this page ----------------------------
+        # ── harvest record links on this page ───────────────────────
         for a in soup.select('a[href*="/record=b"]'):
             rec = _uparse.urljoin(url, a["href"])
             if _is_eresource(rec):
                 dbg("collect", f"    skip E-RES {rec[-28:]}")
                 continue
-            if rec not in phys:
-                dbg("collect", f"    ✓ physical {rec[-28:]}")
-                phys.append(rec)
+            dbg("collect", f"    ✓ physical {rec[-28:]}")
+            return [rec]           # ← EARLY EXIT – **one is enough**
 
-        # --- enqueue inner docs ------------------------------------------
+        # ── enqueue inner docs  (only if we still have nothing) ─────
         leads = (
             [u["href"] for u in soup.select('a[href*="/frameset"]')]
             + [u["src"] for u in soup.select('frame[src], iframe[src]')]
         )
+
         for l in leads:
             if not l:
                 continue
             nxt = _uparse.urljoin(url, l)
-            if any(b in nxt for b in _BAD_LEADS):
+
+            # skip every flavour of “…save=…”, “…saved=…”, “…clear_saves=…”
+            if re.search(r"(?:\?|&)(?:save|saved|clear_saves)=", nxt):
                 continue
+
             if _canon(nxt) in seen:
                 continue
             if len(seen) >= _MAX_VISITED:
                 dbg("collect", "    abort – visited>60")
                 break
-            q.append(nxt)
-            dbg("collect", f"    add lead {nxt[-60:]}")
 
-    dbg("collect", f"    ∅ {len(phys)} physical copies")
+            q.append(nxt)
+            dbg("collect", f"    add lead {nxt}")
+
+    dbg("collect", f"    ∅ 0 physical copies")
     return phys
 
 # ─── tokenisers / surname helper ─────────────────────────────────────
@@ -321,22 +411,6 @@ _ERS_TAGS = (
     "www-link",
 )
 
-# --------------------------------------------------------------------
-# URLs that should **never** be followed while crawling hit-lists
-# (they lead to patron login pages, redirect handlers, etc.)
-# --------------------------------------------------------------------
-_BAD_LEADS = (
-    "/clientredirect", "/patroninfo~", "/validate/patroninfo",
-    "/requestmulti~",  "/mylistsmulti", "/logout",
-    "/frameset&save",  "/save_recid",   "/redirect=",
-
-    # ⇣  new: all the “My List” variants that clutter the queue
-    "?save_func=", "&save=", "&saved=", "&clear_saves="
-)
-
-_SE_MARK = re.compile(r'~s([a-z0-9]+)\*est$', re.I)
-
-
 def _is_eresource(rec_url: str) -> bool:
     """
     Treat the record as a **virtual-only** item **iff**
@@ -366,38 +440,38 @@ def _is_eresource(rec_url: str) -> bool:
     dbg("_is_eresource", f"{rec_url} → {eres}")
     return eres
 
+# ---------------------------------------------------------------------
+# _looks_like_same_book – new body with Slavic-name canonicalisation
+# ---------------------------------------------------------------------
 def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
     """
-    Decide whether the ESTER record behind `rec_url` represents the same
-    book we’re looking for (`w_ttl`, `w_aut`).
-
-    Returns
-    -------
-    bool
-        True  → accept this record as a match
-        False → skip and keep searching
+    Decide whether the ESTER record behind *rec_url* is the same book as
+    (*w_ttl* /*w_aut*).  Returns True for a match.
     """
-    # ── 1. Fetch & parse the record page ─────────────────────────────
-    r_ttl, r_aut = _ester_fields(rec_url)            # helper already in file
-    if not r_ttl:                                    # page unreachable / parse fail
+    # 1. pull title / author from the record page ---------------------
+    r_ttl, r_aut = _ester_fields(rec_url)
+    if not r_ttl:                        # fetch / parse failed
         return False
 
-    # ── 2. Token-ise everything we’ll compare ───────────────────────
-    wanted_toks  = _tokenise(strip_parens(w_ttl))        # title from Goodreads
-    record_toks  = _tokenise(r_ttl) | _tokenise(r_aut)   # all tokens from ESTER
-    author_toks  = _tokenise(w_aut)                      # every word of wanted author
+    # 2. tokenise -----------------------------------------------------
+    wanted_toks = _tokenise(strip_parens(w_ttl))
+    record_toks = _tokenise(r_ttl) | _tokenise(r_aut)
 
-    # ── 3. Title overlap test ───────────────────────────────────────
-    shared_toks = sorted(record_toks & wanted_toks)
-    title_ok    = len(shared_toks) >= max(1, len(wanted_toks) // 2)
+    # ---- TITLE test -------------------------------------------------
+    ttl_ok = wanted_toks <= record_toks            # need *all* wanted words
 
-    # ── 4. Author overlap test (fixed) ──────────────────────────────
-    surname_raw   = _surname(w_aut)                     # e.g. 'saint-exupery'
-    surname_parts = _tokenise(surname_raw)              # {'saint', 'exupery'}
-    shared_auth   = sorted(record_toks & author_toks)
-    author_ok     = (not surname_parts) or surname_parts.issubset(record_toks)
+    # ---- AUTHOR test (new) ------------------------------------------
+    # a) take the surname part(s) of the wanted author
+    surname_raw   = _surname(w_aut)                # “Aleksijevitš” etc.
+    surname_parts = _tokenise(surname_raw)         # {'aleksijevits'}
 
-    # ── 5. DEBUG dump ───────────────────────────────────────────────
+    # b) canonicalise both sides to tolerate Aleksijevitš ↔ Alexievich
+    wanted_canon  = {_canon_name(p) for p in surname_parts}
+    record_canon  = {_canon_name(t) for t in record_toks}
+
+    auth_ok = not surname_parts or wanted_canon <= record_canon
+
+    # ---- DEBUG dump (unchanged) -------------------------------------
     if DEBUG:
         print("┌─  title/author comparator ──────────────────────────────────────")
         print(f"│  record URL      : {rec_url}")
@@ -407,15 +481,15 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
         print(f"│  record aut      : {r_aut!r}")
         print(f"│  wanted toks     : {sorted(wanted_toks)}")
         print(f"│  record toks     : {sorted(record_toks)}")
-        print(f"│  shared ttl toks : {shared_toks}  ({len(shared_toks)}/{len(wanted_toks)} match)")
-        print(f"│  author toks     : {shared_auth}  ({len(shared_auth)}/{len(author_toks)} match)")
         print(f"│  surname parts   : {sorted(surname_parts)}")
-        print(f"│  all parts {'present' if author_ok else 'NOT present'} in record tokens")
-        verdict = "MATCH" if (title_ok and author_ok) else "SKIP"
-        colour  = "grn" if verdict == "MATCH" else "red"
+        print(f"│  canon wanted    : {sorted(wanted_canon)}")
+        print(f"│  canon record    : {sorted(record_canon)}")
+        verdict = 'MATCH' if ttl_ok and auth_ok else 'SKIP'
+        colour  = 'grn' if verdict == 'MATCH' else 'red'
         print(f"└── verdict: {CLR[colour]}{verdict}{CLR['reset']}\n")
 
-    return title_ok and author_ok
+    return ttl_ok and auth_ok
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Helper: pretty-print one (loc, status) pair
@@ -870,13 +944,37 @@ def by_keyword(a,t):
     return _probe("keyword-ttl",f"{SEARCH}/X?searchtype=X&searcharg="
                                 f"{urllib.parse.quote_plus(q,safe='{}')}"
                                 "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
-def search(a,t,isbn):
-    t=strip_parens(t)
-    for fn,arg in ((by_isbn,isbn),(by_title_index,t),(by_keyword,(a,t)),(by_keyword,("",t))):
-        if not arg: continue
-        links=fn(*arg) if isinstance(arg,tuple) else fn(arg)
-        if links: return links
-    return []
+def search(author: str, title: str, isbn: str) -> list[str]:
+    """
+    Return **at most one** ESTER record URL – the first one that
+    convincingly matches *author* + *title*.
+
+    The probes are tried in this order:
+      1. ISBN
+      2. title-index search
+      3. keyword “author title”
+      4. keyword “title”
+    """
+    title = strip_parens(title)
+
+    probes = (
+        (by_isbn,       isbn),
+        (by_title_index, title),
+        (by_keyword,    (author, title)),
+        (by_keyword,    ("", title)),
+    )
+
+    for fn, arg in probes:
+        if not arg:                                   # empty ISBN etc.
+            continue
+
+        links = fn(*arg) if isinstance(arg, tuple) else fn(arg)
+
+        for rec in links:                             # evaluate on the fly
+            if _looks_like_same_book(title, author, rec):
+                return [rec]                          # ← EARLY EXIT
+
+    return []                                         # nothing matched
 
 # ─── worker ──────────────────────────────────────────────────────────
 def _openlib_link(isbn13: str, size: str = "M") -> str:
@@ -886,34 +984,55 @@ def _openlib_link(isbn13: str, size: str = "M") -> str:
         "?default=false"          # << *** key change  ***
     )   
 
-def process_title(idx,total,a,t,isbn):
-    t0=time.time()
-    log(f"[{idx:3}/{total}]",f"{a} – {t}","cyan")
-    log("🔖 ISBN:",isbn or "— none —","pur")
-    copies=Counter(); meta={}
-    recs=search(a,t,isbn); rec=recs[0] if recs else None
-    if rec and _looks_like_same_book(t,a,rec):
-        RECORD_URL[(a,t)] = rec
-        RECORD_ISBN[rec] = isbn or ""
-        _record_brief(rec, f"{a} – {t}", isbn or "")
-        for loc, status in holdings(rec):
-                name, addr = resolve(loc)
-                key        = f"{name}|{addr}"
+# ─── worker ──────────────────────────────────────────────────────────
+def process_title(idx: int, total: int,
+                  author: str, title: str, isbn: str) -> tuple[Counter, dict]:
+    """
+    • log progress
+    • call `search()`
+    • collect *KOHAL* holdings for the (single) matching record
+    """
+    t0 = time.time()
+    log(f"[{idx:3}/{total}]", f"{author} – {title}", "cyan")
+    log("🔖 ISBN:", isbn or "— none —", "pur")
 
-                # availability count for the pin colour
-                if "KOHAL" in status:
-                    copies[(a, t, key)] += 1
+    copies: Counter                   = Counter()
+    meta:   dict[str, tuple[str, str]] = {}
 
-                meta[key] = (name, addr)
+    recs = search(author, title, isbn)
+    if not recs:                                      # zero matches
+        log("✗", "no matching record on ESTER", "red")
+        FAILED.append(f"{author} – {title}" + (f" (ISBN {isbn})"
+                                               if isbn else ""))
+        log("⏳", f"{time.time() - t0:.2f}s", "pur")
+        return copies, meta
 
-                # # NEW — echo every copy line to the console
-                # dbg("•", f"{loc}\t{status}", "dim")
-    tot=sum(copies.values())
-    log("✓" if tot else "✗",f"{tot} × KOHAL" if tot else "0 × KOHAL",
+    rec = recs[0]                                     # exactly one
+    RECORD_URL[(author, title)] = rec
+    RECORD_ISBN[rec]            = isbn or ""
+    _record_brief(rec, f"{author} – {title}", isbn or "")
+
+    # ── holdings ------------------------------------------------------------
+    for loc, status in holdings(rec):
+        name, addr = resolve(loc)
+        key        = f"{name}|{addr}"
+
+        if "KOHAL" in status:
+            copies[(author, title, key)] += 1
+
+        meta[key] = (name, addr)
+
+    tot = sum(copies.values())
+    log("✓" if tot else "✗",
+        f"{tot} × KOHAL" if tot else "0 × KOHAL",
         "grn" if tot else "red")
-    if not tot: FAILED.append(f"{a} – {t}"+(f" (ISBN {isbn})" if isbn else ""))
-    log("⏳",f"{time.time()-t0:.2f}s","pur")
-    return copies,meta
+
+    if not tot:
+        FAILED.append(f"{author} – {title}"
+                      + (f" (ISBN {isbn})" if isbn else ""))
+
+    log("⏳", f"{time.time() - t0:.2f}s", "pur")
+    return copies, meta
 
 # ─── map builder ─────────────────────────────────────────────────────
 def build_map(lib_books, meta, coords, outfile):
