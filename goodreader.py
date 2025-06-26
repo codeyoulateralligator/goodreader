@@ -315,13 +315,18 @@ _BAD_LEADS = (
 
 def collect_record_links(start_url: str) -> list[str]:
     """
-    Breadth-first walk – **but return immediately after the
-    first physical record link is discovered.**
-    """
-    q:    deque[str] = deque([start_url])
-    seen: set[str]   = set()
+    Breadth-first crawl starting at *start_url* and return the **first**
+    physical ESTER record link (``.../record=bNNNNNNN~S8*est``) encountered.
 
-    phys: list[str]  = []
+    The walk stops as soon as one such link is found or after the safety
+    limit of 60 distinct pages has been reached.
+
+    Links whose URL matches anything in the `_BAD_LEADS` blacklist are
+    skipped immediately – they are patron-session / redirect boiler-plate
+    that can never contain holdings pages and often lead to infinite loops.
+    """
+    q: deque[str] = deque([start_url])
+    seen: set[str] = set()
 
     while q:
         url = q.popleft()
@@ -333,19 +338,19 @@ def collect_record_links(start_url: str) -> list[str]:
         dbg("collect open", url)
         soup = BeautifulSoup(_download(url), "html.parser")
 
-        # ── harvest record links on this page ───────────────────────
+        # ── 1. harvest record links already on this page ─────────────
         for a in soup.select('a[href*="/record=b"]'):
             rec = _uparse.urljoin(url, a["href"])
             if _is_eresource(rec):
                 dbg("collect", f"    skip E-RES {rec[-28:]}")
                 continue
             dbg("collect", f"    ✓ physical {rec[-28:]}")
-            return [rec]           # ← EARLY EXIT – **one is enough**
+            return [rec]                        # ← EARLY EXIT
 
-        # ── enqueue inner docs  (only if we still have nothing) ─────
+        # ── 2. enqueue inner documents (framesets / iframes) ─────────
         leads = (
-            [u["href"] for u in soup.select('a[href*="/frameset"]')]
-            + [u["src"] for u in soup.select('frame[src], iframe[src]')]
+            [f["href"] for f in soup.select('a[href*="/frameset"]')] +
+            [f["src"]  for f in soup.select('frame[src], iframe[src]')]
         )
 
         for l in leads:
@@ -353,8 +358,9 @@ def collect_record_links(start_url: str) -> list[str]:
                 continue
             nxt = _uparse.urljoin(url, l)
 
-            # skip every flavour of “…save=…”, “…saved=…”, “…clear_saves=…”
-            if re.search(r"(?:\?|&)(?:save|saved|clear_saves)=", nxt):
+            # skip anything on the do-not-touch list
+            if any(bad in nxt or nxt.startswith(bad) for bad in _BAD_LEADS):
+                dbg("collect", f"    skip bad-lead {nxt[:80]}")
                 continue
 
             if _canon(nxt) in seen:
@@ -366,8 +372,8 @@ def collect_record_links(start_url: str) -> list[str]:
             q.append(nxt)
             dbg("collect", f"    add lead {nxt}")
 
-    dbg("collect", f"    ∅ 0 physical copies")
-    return phys
+    dbg("collect", "    ∅ 0 physical copies")
+    return []
 
 # ─── tokenisers / surname helper ─────────────────────────────────────
 _norm_re=re.compile(r"[^a-z0-9]+")
@@ -1139,6 +1145,8 @@ def main():
     ap.add_argument("--output",type=pathlib.Path,default="want_to_read_map.html")
     a=ap.parse_args(); DEBUG|=a.debug
 
+    t0 = time.time()
+
     titles=gd_csv(a.goodreads_csv,a.max_titles) if a.goodreads_csv \
           else parse_web_shelf(a.goodreads_user,a.max_titles)
     log("ℹ",f"{len(titles)} titles","cyan")
@@ -1178,6 +1186,9 @@ def main():
         log("\n=== TITLES WITH NO *KOHAL* COPIES ===","","red")
         for line in FAILED: log("✗",line,"red")
         log(f"Total missing: {len(FAILED)}","","red")
+
+    total_time = time.time() - t0
+    log("⏱", f"Total time spent: {total_time:.2f}s", "yel")
 
 if __name__=="__main__":
     main()
