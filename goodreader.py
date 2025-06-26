@@ -16,7 +16,9 @@ from bs4 import BeautifulSoup
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from requests.exceptions import ReadTimeout
-import hashlib
+import hashlib 
+import urllib.parse as _uparse
+
 
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
@@ -38,6 +40,7 @@ RECORD_ISBN: dict[str, str] = {}       # record-url  →  isbn13
 _BRIEF_CACHE: dict[str, str] = {} 
 _ID_SEEN: set[str] = set()
 _SURNAME_CLEAN = re.compile(r"[^a-z0-9]+")
+_ERS_CACHE: dict[str, bool] = {}   # record-URL → verdict  (memo)
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -195,65 +198,86 @@ def parse_web_shelf(uid: str, limit: int | None):
     return out
 
 # ─── Smarter hit-list crawler  ───────────────────────────────────────
-# ─── collect_record_links – final fix ────────────────────────────────
+def _canon(url: str) -> str:
+    """
+    Drop query-string, chop “…/frameset…” tail, unquote %XX.
+
+    Example:
+        https://www.ester.ee/search…/frameset&FF=foo&save=bar
+        → https://www.ester.ee/search~S8*est
+    """
+    s    = _uparse.urlsplit(url)
+    path = _uparse.unquote(s.path)
+    if '/frameset' in path:
+        path = path.split('/frameset', 1)[0]
+    return _uparse.urlunsplit((s.scheme, s.netloc, path, '', ''))
+
+
+_MAX_VISITED = 60          # safety valve
+_BAD_LEADS = (
+    "/clientredirect", "/patroninfo~", "/validate/patroninfo",
+    "/requestmulti~",  "/mylistsmulti", "/logout",
+    "/frameset&save",  "/save_recid",   "/redirect=",
+    "?save_func=", "&save=", "&saved=", "&clear_saves=",
+)
+
 def collect_record_links(start_url: str) -> list[str]:
     """
-    Crawl an ESTER hit-list (of any flavour) and return **the first physical
-    /record=b… URL**.  Strategy:
+    Breadth-first walk:
 
-    1.  Breadth-first walk starting from *start_url*.
-        • follow <a href="…frameset…">, <a href="…frameset&FF=…">,
-          <frame src="…"> and <iframe src="…">.
-    2.  Every time we bump into <a href="/record=b…">:
-        • if the record is physical  → return it immediately;
-        • if it’s an e-resource      → ignore and keep crawling.
-    3.  When the queue is empty → return []  (nothing printable).
-
-    This **never bails out just because it saw a /record=b link** – it
-    bails only when it sees a *physical* one.
+      1. open *start_url*
+      2. follow every “…/frameset…” link, every <frame>, every <iframe>
+      3. whenever we see /record=b… :
+           • skip if virtual         → continue crawling
+           • keep if physical        → add to output (deduped)
+      4. stop when the queue is empty or we hit _MAX_VISITED pages
     """
-    queue: deque[str] = deque([start_url])
-    seen:  set[str]   = set()
+    q     : deque[str] = deque([start_url])
+    seen  : set[str]   = set()
+    phys  : list[str]  = []
 
-    while queue:
-        url = queue.popleft()
-        if url in seen:
+    while q:
+        url = q.popleft()
+        key = _canon(url)
+        if key in seen:
             continue
-        seen.add(url)
+        seen.add(key)
 
         dbg("collect open", url)
         html = _download(url)
         soup = BeautifulSoup(html, "html.parser")
 
-        # ------------------------------------------------------------------
-        # 1. Any record links in this document?
-        # ------------------------------------------------------------------
+        # --- harvest record links on this page ----------------------------
         for a in soup.select('a[href*="/record=b"]'):
-            rec = urllib.parse.urljoin(url, a["href"])
+            rec = _uparse.urljoin(url, a["href"])
             if _is_eresource(rec):
                 dbg("collect", f"    skip E-RES {rec[-28:]}")
-                continue           # keep looking
-            dbg("collect", f"    ✓ physical {rec[-28:]}")
-            return [rec]          # ←────── success
+                continue
+            if rec not in phys:
+                dbg("collect", f"    ✓ physical {rec[-28:]}")
+                phys.append(rec)
 
-        # ------------------------------------------------------------------
-        # 2. Enqueue *every* inner document we can think of
-        # ------------------------------------------------------------------
+        # --- enqueue inner docs ------------------------------------------
         leads = (
-            [u["href"] for u in soup.select('a[href*="/frameset"]')] +
-            [u["src"]  for u in soup.select('frame[src], iframe[src]')]
+            [u["href"] for u in soup.select('a[href*="/frameset"]')]
+            + [u["src"] for u in soup.select('frame[src], iframe[src]')]
         )
-        new_leads = [
-            urllib.parse.urljoin(url, l) for l in leads
-            if l and urllib.parse.urljoin(url, l) not in seen
-        ]
-        if new_leads:
-            dbg("collect", f"    add {len(new_leads)} leads")
-            queue.extend(new_leads)
+        for l in leads:
+            if not l:
+                continue
+            nxt = _uparse.urljoin(url, l)
+            if any(b in nxt for b in _BAD_LEADS):
+                continue
+            if _canon(nxt) in seen:
+                continue
+            if len(seen) >= _MAX_VISITED:
+                dbg("collect", "    abort – visited>60")
+                break
+            q.append(nxt)
+            dbg("collect", f"    add lead {nxt[-60:]}")
 
-    # queue exhausted – no physical record anywhere in this hit list
-    dbg("collect", "    ∅ no physical copies")
-    return []
+    dbg("collect", f"    ∅ {len(phys)} physical copies")
+    return phys
 
 # ─── tokenisers / surname helper ─────────────────────────────────────
 _norm_re=re.compile(r"[^a-z0-9]+")
@@ -265,12 +289,17 @@ def _surname(a):    # supports “Lastname, Firstname”
 
 # ─── HTTP download (cached) ──────────────────────────────────────────
 SESSION = requests.Session()
-def _download(url:str)->str:
-    if url in HTML_CACHE: return HTML_CACHE[url]
-    dbg(f"GET {url}")
-    try: r=SESSION.get(url,headers=HDRS,timeout=TIMEOUT)
-    except ReadTimeout: r=SESSION.get(url,headers=HDRS,timeout=TIMEOUT)
-    r.raise_for_status(); HTML_CACHE[url]=r.text
+def _download(url: str) -> str:
+    if url in HTML_CACHE:
+        return HTML_CACHE[url]
+    try:
+        r = SESSION.get(url, headers=HDRS, timeout=TIMEOUT, allow_redirects=True)
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        dbg("GET-ERR", f"{url[-60:]} → {e.response.status_code}")
+        HTML_CACHE[url] = ""          # remember it’s useless
+        return ""                     # let caller treat as “no data”
+    HTML_CACHE[url] = r.text
     return r.text
 
 # ─── ESTER utilities ────────────────────────────────────────────────
@@ -284,17 +313,58 @@ def _ester_fields(rec):
             strip_ctrl(aut.get_text(" ",strip=True)) if aut else "")
 
 _ERS_TAGS = (
-    "1 võrguressurss",   # ESTER description for an online item
-    "tekstifail",        # EPub / PDF etc.
-    "audiofile", "videosalvestis",
+    "1 võrguressurss", "tekstifail", "audiofile", "videosalvestis",
+    "võrguteavik", "1 online resource", "online resource",
+    "electronic bk", "electronic resource",
+    "e-raamat", "ebook", "e-audiobook", "e-raamat",
+    "digitaalkogu", "internetiväljaanne", "pdf (online)", "pdf-fail",
+    "www-link",
 )
 
+# --------------------------------------------------------------------
+# URLs that should **never** be followed while crawling hit-lists
+# (they lead to patron login pages, redirect handlers, etc.)
+# --------------------------------------------------------------------
+_BAD_LEADS = (
+    "/clientredirect", "/patroninfo~", "/validate/patroninfo",
+    "/requestmulti~",  "/mylistsmulti", "/logout",
+    "/frameset&save",  "/save_recid",   "/redirect=",
+
+    # ⇣  new: all the “My List” variants that clutter the queue
+    "?save_func=", "&save=", "&saved=", "&clear_saves="
+)
+
+_SE_MARK = re.compile(r'~s([a-z0-9]+)\*est$', re.I)
+
+
 def _is_eresource(rec_url: str) -> bool:
-    page = _download(rec_url).lower()
-    dbg("Downloaded page", f"{rec_url} → {len(page):,} B")
-    is_ere = any(tag in page for tag in _ERS_TAGS)
-    dbg(f"is_eresource: {rec_url} → {is_ere}")
-    return is_ere
+    """
+    Treat the record as a **virtual-only** item **iff**
+
+      – the record page shows *no* holdings table **and**
+      – at least one string from `_ERS_TAGS` occurs in the HTML.
+
+    (Uses `_ERS_CACHE` for memoisation.)
+    """
+    if rec_url in _ERS_CACHE:             # memoised result → instant
+        return _ERS_CACHE[rec_url]
+
+    html = _download(rec_url)             # your existing cached GET
+    soup = BeautifulSoup(html, 'html.parser')
+
+    has_physical = bool(
+        soup.select_one("tr.bibItemsEntry, tr[class*=bibItemsEntry]")
+    )
+    if has_physical:
+        _ERS_CACHE[rec_url] = False
+        dbg("_is_eresource", f"{rec_url} → False (physical holdings present)")
+        return False
+
+    page_lc = html.lower()
+    eres    = any(tag.lower() in page_lc for tag in _ERS_TAGS)
+    _ERS_CACHE[rec_url] = eres
+    dbg("_is_eresource", f"{rec_url} → {eres}")
+    return eres
 
 def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
     """
