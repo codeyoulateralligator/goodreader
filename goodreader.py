@@ -855,38 +855,51 @@ def _record_brief(rec, fallback_title: str = "", isbn: str = "") -> str:
         _BRIEF_CACHE[url] = brief
     return brief
 
-_JS_SNIPPET = """
+_JS_SNIPPET = r"""
 <script>
-/* turn “&lt;br&gt;” etc. back into real tags */
+/* Helper: rebuild the heading line on demand ------------------------ */
+function headingHTML(hasSel){
+  return (hasSel
+            ? '<button id="closeSel" onclick="clearSelection()" '
+              + 'style="float:right;font-weight:bold;background:#eee;'
+              + 'border:1px solid #999;border-radius:3px;width:1.6em;'
+              + 'height:1.6em;line-height:1.2em;cursor:pointer;">&times;</button>'
+            : '')
+       + '<h3 style="margin:0;">Valitud raamatud</h3>';
+}
+
+/* Simple HTML-entity unescape for tooltips -------------------------- */
 function decodeHTML(str){
   const t = document.createElement('textarea');
   t.innerHTML = str;
   return t.value;
 }
 
-const chosen      = new Map();
-const headingHTML = '<button id="closeSel" onclick="clearSelection()" '
-                  + 'style="float:right;font-weight:bold;background:#eee;'
-                  + 'border:1px solid #999;border-radius:3px;width:1.6em;'
-                  + 'height:1.6em;line-height:1.2em;cursor:pointer;">&times;</button>'
-                  + '<h3 style="margin:0;">Valitud raamatud</h3>';
+const chosen = new Map();
 
+/* Re-render the panel ------------------------------------------------ */
+function refreshPanel(){
+  const box     = document.getElementById("selectionBox");
+  const hasSel  = chosen.size > 0;
+  const items   = Array.from(chosen.values())
+                       .map(txt => "<p>"+txt+"</p>")
+                       .join("<hr style='margin:.4em 0;width:100%;'>");
+  box.innerHTML = headingHTML(hasSel) + items;
+}
+
+/* Clear everything --------------------------------------------------- */
 function clearSelection(){
-  /* remove boldface from every previously chosen <li> */
   for (const id of chosen.keys()){
     const li = document.getElementById(id);
     if (li) li.style.fontWeight = "normal";
   }
   chosen.clear();
-
-  /* reset panel to just the heading + close button */
-  document.getElementById("selectionBox").innerHTML = headingHTML;
+  refreshPanel();
 }
 
+/* Toggle one book in/out of the list --------------------------------- */
 function toggleBook(id){
-  const li    = document.getElementById(id);
-  const panel = document.getElementById("selectionBox");
-
+  const li = document.getElementById(id);
   if (chosen.has(id)){
     chosen.delete(id);
     li.style.fontWeight = "normal";
@@ -894,12 +907,7 @@ function toggleBook(id){
     chosen.set(id, decodeHTML(li.dataset.brief));
     li.style.fontWeight = "bold";
   }
-
-  panel.innerHTML =
-      headingHTML +
-      Array.from(chosen.values())
-           .map(txt => "<p>"+txt+"</p>")
-           .join("<hr style=\'margin:.4em 0; display:block; width:100%;\'>");
+  refreshPanel();
 }
 </script>
 
@@ -914,13 +922,11 @@ function toggleBook(id){
 
 <!-- initial empty panel -->
 <div id="selectionBox">
-  <button id="closeSel" onclick="clearSelection()" 
-          style="float:right;font-weight:bold;background:#eee;border:1px solid #999;
-                 border-radius:3px;width:1.6em;height:1.6em;line-height:1.2em;
-                 cursor:pointer;">&times;</button>
+  <!-- headingHTML(false) -->
   <h3 style="margin:0;">Valitud raamatud</h3>
 </div>
 """
+
 
 # ─── search helpers ──────────────────────────────────────────────────
 def _probe(label: str, url: str) -> list[str]:
