@@ -747,60 +747,86 @@ def _first_good_url(urls: list[str]) -> str:
             dbg(f"Exception for URL {u}: {e}")
     return ""
 
-# ─────────────────────────────────────────────────────────────────────
-# NEW helper – write one compact gallery page with every cover found
-# --------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+#  new _write_covers_page  –  wider tiles, caption under the jacket
 # ────────────────────────────────────────────────────────────────────
 def _write_covers_page(outfile: str = "all_covers.html") -> None:
     """
-    Build a self-contained HTML gallery that shows every unique
-    “Author – Title” together with the cover picked earlier.
+    Build a standalone HTML gallery.
+
+    • one <figure> per book
+    • cover on top, title/author underneath – aligned in a nice grid
     """
-    # 1. gather unique snippets --------------------------------------
-    gallery: list[tuple[str, str, str]] = []     # (surname key, title key, brief HTML)
+    import html, re
+
+    gallery: list[tuple[str, str, str]] = []      # (surname-key, title-key, brief)
     seen: set[str] = set()
 
     for (author, title), rec_url in RECORD_URL.items():
-        brief = _record_brief(rec_url,
-                              f"{author} – {title}",
-                              RECORD_ISBN.get(rec_url, ""))
+        brief = _record_brief(
+            rec_url,
+            f"{author} – {title}",
+            RECORD_ISBN.get(rec_url, "")
+        )
         if brief in seen:
             continue
         seen.add(brief)
         gallery.append((_surname(author), title.lower(), brief))
 
-    if not gallery:        # nothing to show
-        return
+    if not gallery:
+        return                                      # nothing to write
 
-    gallery.sort()         # by surname, then title
+    gallery.sort()                                  # by surname → title
 
-    # 2. emit HTML ---------------------------------------------------
+    # helper: split cached snippet into IMG + CAPTION -----------------
+    IMG_RE = re.compile(r"<img[^>]+>", re.I)
+
+    def split_brief(snippet: str) -> tuple[str, str]:
+        m = IMG_RE.search(snippet)
+        if m:
+            img = m.group(0)
+            caption = snippet.replace(img, "", 1)
+        else:                                       # no cover at all
+            img = ""
+            caption = snippet
+        return img, caption
+
+    # -------------------------------------------------------- emit ----
     with open(outfile, "w", encoding="utf-8") as fh:
         fh.write(
             "<!doctype html>\n<meta charset='utf-8'>\n"
-            "<title>Goodreads → ESTER – kõik kaaned</title>\n"
+            "<title>Goodreads → ESTER – kaanekogu</title>\n"
             "<style>\n"
             " body{font-family:sans-serif;margin:1.4rem;}\n"
             " h1{margin:.2rem 0 1.2rem;font-size:1.8rem;}\n"
-            " .grid{display:grid;gap:1.2rem;"
-            "       grid-template-columns:repeat(auto-fit,minmax(180px,1fr));}\n"
-            " figure{margin:0;text-align:center;border:1px solid #ccc;"
-            "        padding:.6rem;border-radius:.4rem;background:#fafafa;"
-            "        box-shadow:0 2px 4px rgba(0,0,0,.1);}\n"
-            " figure img{max-width:100%;height:180px;object-fit:contain;"
-            "            margin-bottom:.4rem;}\n"
-            " figcaption{font-size:.88rem;line-height:1.25rem;}\n"
-            " a{text-decoration:none;color:#036;}\n"
+            " .grid{display:grid;gap:1.6rem;"
+            "       grid-template-columns:repeat(auto-fit,minmax(240px,1fr));}\n"
+            " figure{margin:0;display:flex;flex-direction:column;"
+            "        align-items:center;border:1px solid #ccc;"
+            "        padding:.8rem;border-radius:.5rem;background:#fafafa;"
+            "        box-shadow:0 2px 4px rgba(0,0,0,.08);}\n"
+            " figure img{height:220px;max-width:100%;object-fit:contain;"
+            "            margin-bottom:.8rem;}\n"
+            " figcaption{font-size:.9rem;line-height:1.3rem;text-align:center;}\n"
+            " a{text-decoration:none;color:#035;}\n"
             " a:hover{text-decoration:underline;}\n"
             "</style>\n"
             "<h1>Kogu kaanekogu</h1>\n"
             "<section class='grid'>\n"
         )
-        for _sk, _tk, brief in gallery:
-            fh.write(f"  <figure>{brief}</figure>\n")
-        fh.write("</section>")
 
-    log("✓", f"[Done] {outfile}", "grn")
+        for _sk, _tk, brief in gallery:
+            img_html, caption_html = split_brief(brief)
+            fh.write("  <figure>")
+            fh.write(img_html or
+                     "<div style='height:220px;display:flex;"
+                     "justify-content:center;align-items:center;"
+                     "color:#666;font-size:.8rem;'>– no cover –</div>")
+            fh.write(f"<figcaption>{caption_html}</figcaption></figure>\n")
+
+        fh.write("</section>")
+    log('✓', f"[Done] {outfile}", 'grn')
+
 
 # --- helper ----------------------------------------------------
 def _mark(src: str):
