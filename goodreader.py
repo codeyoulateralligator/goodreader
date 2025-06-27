@@ -1316,7 +1316,7 @@ def build_map(lib_books, meta, coords, outfile):
     lons = [lo for _, lo in coords.values()]
     centre = (sum(lats) / len(lats), sum(lons) / len(lons))
 
-    m = folium.Map(location=centre, zoom_start=11)
+    m = folium.Map(location=centre, zoom_start=13)
     folium.Element(
         "<style>.leaflet-popup-content{max-width:1600px;}</style>"
     ).add_to(m)
