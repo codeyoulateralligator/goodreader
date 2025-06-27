@@ -660,27 +660,85 @@ def _scrape_isbns(soup: BeautifulSoup) -> list[str]:
             isbns.append(m.group(0))
     return isbns
 
-_MIN_BYTES = 2000
+_MIN_BYTES = 1337
 
 def _first_good_url(urls: list[str]) -> str:
     for u in urls:
         try:
-            r = requests.get(u, stream=True, timeout=5, allow_redirects=True)
+            r = requests.get(u, stream=True, timeout=5,
+                             allow_redirects=True)
             ct   = r.headers.get("Content-Type", "")
             size = int(r.headers.get("Content-Length", 0) or 0)
 
             dbg(f"GET {u} → {r.status_code}  {ct}  {size:,} B")
 
-            # --- reject tiny Google-Books placeholders --------------------
-            if ("books.google.com/books/content" in u and size < _MIN_BYTES):
-                continue            # keep looking
+            # ── NEW: skip Google-Books placeholder thumbs ───────────
+            if ("books.google.com/books/content" in u
+                    and size < 5_000):          # ← stricter limit
+                continue                         # keep looking
 
             if r.ok and ct.startswith("image") and size >= _MIN_BYTES:
-                return r.url        # accept this one
+                return r.url                    # accept this one
         except Exception as e:
             dbg(f"Exception for URL {u}: {e}")
-
     return ""
+
+# ─────────────────────────────────────────────────────────────────────
+# NEW helper – write one compact gallery page with every cover found
+# --------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+def _write_covers_page(outfile: str = "all_covers.html") -> None:
+    """
+    Build a self-contained HTML gallery that shows every unique
+    “Author – Title” together with the cover picked earlier.
+    """
+    # 1. gather unique snippets --------------------------------------
+    gallery: list[tuple[str, str, str]] = []     # (surname key, title key, brief HTML)
+    seen: set[str] = set()
+
+    for (author, title), rec_url in RECORD_URL.items():
+        brief = _record_brief(rec_url,
+                              f"{author} – {title}",
+                              RECORD_ISBN.get(rec_url, ""))
+        if brief in seen:
+            continue
+        seen.add(brief)
+        gallery.append((_surname(author), title.lower(), brief))
+
+    if not gallery:        # nothing to show
+        return
+
+    gallery.sort()         # by surname, then title
+
+    # 2. emit HTML ---------------------------------------------------
+    with open(outfile, "w", encoding="utf-8") as fh:
+        fh.write(
+            "<!doctype html>\n<meta charset='utf-8'>\n"
+            "<title>Goodreads → ESTER – kõik kaaned</title>\n"
+            "<style>\n"
+            " body{font-family:sans-serif;margin:1.4rem;}\n"
+            " h1{margin:.2rem 0 1.2rem;font-size:1.8rem;}\n"
+            " .grid{display:grid;gap:1.2rem;"
+            "       grid-template-columns:repeat(auto-fit,minmax(180px,1fr));}\n"
+            " figure{margin:0;text-align:center;border:1px solid #ccc;"
+            "        padding:.6rem;border-radius:.4rem;background:#fafafa;"
+            "        box-shadow:0 2px 4px rgba(0,0,0,.1);}\n"
+            " figure img{max-width:100%;height:180px;object-fit:contain;"
+            "            margin-bottom:.4rem;}\n"
+            " figcaption{font-size:.88rem;line-height:1.25rem;}\n"
+            " a{text-decoration:none;color:#036;}\n"
+            " a:hover{text-decoration:underline;}\n"
+            "</style>\n"
+            "<h1>Kogu kaanekogu</h1>\n"
+            "<section class='grid'>\n"
+        )
+        for _sk, _tk, brief in gallery:
+            fh.write(f"  <figure>{brief}</figure>\n")
+        fh.write("</section>")
+
+    log("✓", f"[Done] {outfile}", "grn")
+
+
 # ---------------------------------------------------------------------------
 # smarter cover hunt with verbose logging
 # ---------------------------------------------------------------------------
@@ -972,31 +1030,38 @@ def _first_google_image(query: str) -> str:
 # ─── search helpers ──────────────────────────────────────────────────
 def _probe(label: str, url: str) -> list[str]:
     """
-    Run one ESTER probe, log hit-count *and* the probe-URL, then return
-    the list of record links found.
+    Run one ESTER probe, log its hit-count *and* the probe-URL, then
+    return the list of record links that were found.
     """
+    # crawl the URL and collect record links
     links = collect_record_links(url)
     hits  = len(links)
 
+    # colour for the progress line (green when there are hits)
     colour = "grn" if hits else "red"
-    log("🛰 probe", f"{label:<11} {hits} hit(s)", colour)
-    log("↳", url, "dim")                     # always print the URL
+
+    # diagnostic summary
+    log("🛰 probe", f"{label:<14} {hits} hit(s)", colour)
+    log("↳", url, "dim")   # always show the exact probe URL
 
     return links
+
 
 def by_isbn(isbn): 
     return _probe("keyword-isbn",f"{SEARCH}/X?searchtype=X&searcharg={isbn}"
                                                "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
-def by_title_index(t):
-    q=ester_enc(norm_dash(t))
-    return _probe("title-idx",f"{SEARCH}/X?searchtype=t&searcharg="
-                              f"{urllib.parse.quote_plus(q,safe='{}')}"
-                              "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
-def by_keyword(a,t):
-    raw=squeeze(f"{a} {t}"); q=ester_enc(norm_dash(raw))
-    return _probe("keyword-ttl",f"{SEARCH}/X?searchtype=X&searcharg="
-                                f"{urllib.parse.quote_plus(q,safe='{}')}"
-                                "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+def by_title_index(t, *, _label="title-idx"):
+    q = ester_enc(norm_dash(t))
+    return _probe(_label, f"{SEARCH}/X?searchtype=t&searcharg="
+                          f"{urllib.parse.quote_plus(q,safe='{}')}"
+                          "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+def by_keyword(a, t, *, _label="keyword-ttl"):
+    raw = squeeze(f"{a} {t}")
+    q   = ester_enc(norm_dash(raw))
+    return _probe(_label, f"{SEARCH}/X?searchtype=X&searcharg="
+                          f"{urllib.parse.quote_plus(q,safe='{}')}"
+                          "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+
 def search(author: str, title: str, isbn: str) -> list[str]:
     """
     Return **at most one** ESTER record URL – the first one that fits.
@@ -1020,22 +1085,24 @@ def search(author: str, title: str, isbn: str) -> list[str]:
 
     # -- ②–④ fallback probes -----------------------------------------
     probes = (
-        (by_title_index, title),
-        (by_keyword,      (author, title)),
-        (by_keyword,      ("", title)),
+        (by_title_index,               (title,),            "title-idx"),
+        (by_keyword,      (author,     title),              "kw-author+title"),
+        (by_keyword,      ("",         title),              "kw-title-only"),
     )
 
-    for fn, arg in probes:
-        if not arg:                             # empty title etc.
+    for fn, args, lbl in probes:
+        # skip probes whose arguments are completely empty
+        if not any(args):
             continue
 
-        links = fn(*arg) if isinstance(arg, tuple) else fn(arg)
+        # forward the explicit label so _probe() prints it
+        links = fn(*args, _label=lbl)
 
-        for rec in links:                       # validate on the fly
+        for rec in links:                     # validate on the fly
             if _looks_like_same_book(title, author, rec):
-                return [rec]                    # first convincing hit
+                return [rec]                  # first convincing hit
 
-    return []                                   # nothing matched
+    return []
 
 # ─── worker ──────────────────────────────────────────────────────────
 def _openlib_link(isbn13: str, size: str = "M") -> str:
@@ -1232,6 +1299,9 @@ def main():
         log("\n=== TITLES WITH NO *KOHAL* COPIES ===","","red")
         for line in FAILED: log("✗",line,"red")
         log(f"Total missing: {len(FAILED)}","","red")
+
+    log("ℹ", "Writing cover gallery page", "cyan")
+    _write_covers_page("all_covers.html")
 
     total_time = time.time() - t0
     log("⏱", f"Total time spent: {total_time:.2f}s", "yel")
