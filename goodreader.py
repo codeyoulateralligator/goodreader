@@ -333,9 +333,14 @@ def collect_record_links(start_url: str) -> list[str]:
         for a in soup.select('a[href*="/record=b"]'):
             rec = _uparse.urljoin(url, a["href"])
             if _is_eresource(rec):
-                dbg("collect", f"    skip E-RES {rec[-28:]}")
+                dbg("collect", f"    skip E-RES {rec}")
                 continue
-            dbg("collect", f"    ✓ physical {rec[-28:]}")
+
+            if _is_nonbook(rec):                   # new non-book guard
+                dbg("collect", f"    skip NON-BOOK {rec}")
+                continue
+
+            dbg("collect", f"    ✓ physical {rec}")
             return [rec]                        # ← EARLY EXIT
 
         # ── 2. enqueue inner documents (framesets / iframes) ─────────
@@ -398,6 +403,20 @@ def _ester_fields(rec):
     aut=soup.select_one("td.bibInfoLabel:-soup-contains('Autor')+td.bibInfoData")
     return (strip_ctrl(ttl.get_text(" ",strip=True)) if ttl else "",
             strip_ctrl(aut.get_text(" ",strip=True)) if aut else "")
+
+_NONBOOK_TAGS = (
+    "videosalvestis", "dvd", "blu-ray",
+    "cd-plaat", "audiofile", "helisalvestis",
+    # feel free to extend when something new slips through
+)
+
+def _is_nonbook(rec_url: str) -> bool:
+    """
+    True  ⇢  the record is a physical *non-book* carrier (DVD, CD, …)
+    False ⇢  looks like a book
+    """
+    html = _download(rec_url).lower()
+    return any(tag in html for tag in _NONBOOK_TAGS)
 
 _ERS_TAGS = (
     "1 võrguressurss", "tekstifail", "audiofile", "videosalvestis",
