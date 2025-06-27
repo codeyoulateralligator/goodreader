@@ -17,7 +17,8 @@ from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 import hashlib 
 import urllib.parse as _uparse
-
+from urllib3.util.retry import Retry
+from requests.adapters   import HTTPAdapter
 
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
@@ -40,6 +41,8 @@ _BRIEF_CACHE: dict[str, str] = {}
 _ID_SEEN: set[str] = set()
 _SURNAME_CLEAN = re.compile(r"[^a-z0-9]+")
 _ERS_CACHE: dict[str, bool] = {}   # record-URL → verdict  (memo)
+COVER_SRC   : Counter[str] = Counter()   # per source “inline/og”, “gbooks”, …
+BOOKS_WITH_COVER = 0                     # total books that ended up with a cover
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -380,19 +383,61 @@ def _surname(a):    # supports “Lastname, Firstname”
     p=_ascii_fold(a).split(); return p[-1] if p else ""
 
 # ─── HTTP download (cached) ──────────────────────────────────────────
+# ─── HTTP download (cached + retry) ─────────────────────────────────
 SESSION = requests.Session()
-def _download(url: str) -> str:
+
+# ① optional: mount a Retry-enabled adapter so we also recover from the
+#    occasional 5xx when Goodreads hiccups
+
+_retry = Retry(total=3,
+               backoff_factor=2.0,           # 0 s, 2 s, 4 s …
+               status_forcelist=[502, 503, 504],
+               allowed_methods=["GET", "HEAD"])
+SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
+SESSION.mount("http://",  HTTPAdapter(max_retries=_retry))
+
+# ② our own thin retry wrapper for *timeouts* -----------------------
+def _download(url: str, *, tries: int = 3,
+              connect_t: int = 8, read_t: int = 60) -> str:
+    """
+    GET *url* with small in-memory cache.
+      • 3 attempts (default)
+      • connect timeout   = 8 s
+      • read timeout      = 60 s       <-- longer than before
+    """
     if url in HTML_CACHE:
         return HTML_CACHE[url]
-    try:
-        r = SESSION.get(url, headers=HDRS, timeout=TIMEOUT, allow_redirects=True)
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        dbg("GET-ERR", f"{url[-60:]} → {e.response.status_code}")
-        HTML_CACHE[url] = ""          # remember it’s useless
-        return ""                     # let caller treat as “no data”
-    HTML_CACHE[url] = r.text
-    return r.text
+
+    for attempt in range(1, tries + 1):
+        try:
+            r = SESSION.get(url,
+                            headers=HDRS,
+                            timeout=(connect_t, read_t),
+                            allow_redirects=True)
+            r.raise_for_status()
+            HTML_CACHE[url] = r.text
+            return r.text
+
+        except (requests.Timeout,
+                requests.exceptions.ReadTimeout) as e:
+
+            dbg("GET-TIMEOUT", f"{url}  (try {attempt}/{tries})")
+            if attempt == tries:          # give up
+                HTML_CACHE[url] = ""
+                return ""
+
+            time.sleep(2 ** attempt)      # 2 s, 4 s back-off and retry
+            continue
+
+        except requests.HTTPError as e:
+            dbg("GET-ERR",
+                f"{url[-60:]} → HTTP {e.response.status_code}")
+            HTML_CACHE[url] = ""
+            return ""
+
+    # should never reach here
+    HTML_CACHE[url] = ""
+    return ""
 
 # ─── ESTER utilities ────────────────────────────────────────────────
 def _ester_fields(rec):
@@ -679,7 +724,7 @@ def _scrape_isbns(soup: BeautifulSoup) -> list[str]:
             isbns.append(m.group(0))
     return isbns
 
-_MIN_BYTES = 1337
+_MIN_BYTES = 1337 # Google placeholder image is about 10.5KB
 
 def _first_good_url(urls: list[str]) -> str:
     for u in urls:
@@ -693,8 +738,8 @@ def _first_good_url(urls: list[str]) -> str:
 
             # ── NEW: skip Google-Books placeholder thumbs ───────────
             if ("books.google.com/books/content" in u
-                    and size < 5_000):          # ← stricter limit
-                continue                         # keep looking
+                    and size < 11000):
+                continue
 
             if r.ok and ct.startswith("image") and size >= _MIN_BYTES:
                 return r.url                    # accept this one
@@ -757,120 +802,168 @@ def _write_covers_page(outfile: str = "all_covers.html") -> None:
 
     log("✓", f"[Done] {outfile}", "grn")
 
+# --- helper ----------------------------------------------------
+def _mark(src: str):
+    """Remember that *src* won the race for this book."""
+    global BOOKS_WITH_COVER
+    COVER_SRC[src] += 1
+    BOOKS_WITH_COVER += 1
 
 # ---------------------------------------------------------------------------
-# smarter cover hunt with verbose logging
+#  smarter cover hunt  –  FINAL (drop-in) VERSION
 # ---------------------------------------------------------------------------
 def _find_cover(
     soup: BeautifulSoup,
     *,
     author: str = "",
-    title: str  = "",
+    title:  str = "",
     isbn_hint: str = ""
 ) -> str:
     """
-    Return a usable jacket URL or "".
-    Prints *all* URLs examined in order, together with the decision made.
-    """
-    tried: list[tuple[str, str]] = []          # (url, verdict)
+    Return a usable cover-image URL or "".
 
+    • Updates   COVER_SRC[label]   and   BOOKS_WITH_COVER.
+    • Silently ignores the Google-Books placeholder (a dull “no cover” tile)
+      which is   books.google.com/books/content … printsec=frontcover …
+    """
+
+    # ── bookkeeping helper ──────────────────────────────────────────
+    def _mark(src_label: str) -> None:
+        global BOOKS_WITH_COVER
+        COVER_SRC[src_label] += 1
+        BOOKS_WITH_COVER    += 1
+
+    tried: list[tuple[str, str]] = []          # (URL, verdict)
+
+    # ── generic URL tester --------------------------------------------------
     def _try(label: str, urls: list[str]) -> str:
-        "Return first good URL or '' and log each attempt."
+        """
+        Iterate through *urls* and accept the first usable image.
+        Every attempt is recorded in *tried* for DEBUG dumps.
+        """
         for u in urls:
             verdict = "skip"
             try:
-                r = requests.get(u, stream=True, timeout=5, allow_redirects=True)
+                r    = requests.get(u, stream=True, timeout=5,
+                                    allow_redirects=True)
                 ct   = r.headers.get("Content-Type", "")
                 size = int(r.headers.get("Content-Length", "0") or 0)
+
+                # ——  ✂️  Google-Books placeholder guard  ✂️  ————————————
+                #  Empirically:
+                #    • real covers   → image/jpeg, invariably contain  "&edge="
+                #    • placeholder   → image/png  (sometimes JPEG)  **no edge**
+                #                      tiny < 15 kB
+                if ("books.google.com/books/content" in u
+                        and "&edge=" not in u
+                        and size < 15_000):
+                    verdict = f"gbooks-placeholder {size} B"
+                    tried.append((u, f"{label}: {verdict}"))
+                    continue                        # look at next candidate
+                # ------------------------------------------------------------------
+
                 if r.ok and ct.startswith("image") and size >= _MIN_BYTES:
                     verdict = f"OK ({size/1024:.1f} kB)"
                     tried.append((u, f"{label}: {verdict}"))
-                    return r.url
+                    _mark(label)
+                    return r.url                   # <-- winner!
+
                 verdict = f"{ct or 'no-CT'} {size} B"
+
             except Exception as e:
                 verdict = f"ERR {e.__class__.__name__}"
+
             finally:
                 tried.append((u, f"{label}: {verdict}"))
-        return ""
 
-    # ── 0. inline <img> and og:image --------------------------------
+        return ""                                 # nothing usable in *urls*
+
+    # ────────────────────────────────────────────────────────────────
+    #  0. inline <img>  +  og:image
+    # ────────────────────────────────────────────────────────────────
     urls0 = []
     for tag in soup.select("img, noscript img"):
         for attr in IMG_ATTRS:
             src = (tag.get(attr) or "").strip()
             if _looks_like_jacket(src):
                 urls0.append(_abs(src))
-    og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+
+    og = (soup.find("meta", property="og:image")
+          or soup.find("meta", attrs={"name": "og:image"}))
     if og and _looks_like_jacket(og.get("content", "")):
         urls0.append(_abs(og["content"]))
+
     if (hit := _try("inline/og", urls0)):
         dbg("cover-pick", hit)
         return hit
 
-    # ── 1. EPiK avalanche & IIIF ------------------------------------
-    code = (
-        re.search(r'record=([b\d]+)', str(soup))
-        or re.search(r'catalog/([b\d]+)', str(soup))
-        or re.search(r'"code"\s*:\s*"([b\d]+)"', str(soup))
-    )
-    if code:
-        code = code.group(1)
-        urls1 = [
-            f"https://www.ester.ee/iiif/2/{code}/full/500,/0/default.jpg"
-        ]
-        # ask avalanche once
-        try:
+    # ────────────────────────────────────────────────────────────────
+    #  1. EPiK avalanche / IIIF
+    # ────────────────────────────────────────────────────────────────
+    code_m = (re.search(r'record=([b\d]+)', str(soup)) or
+              re.search(r'catalog/([b\d]+)', str(soup)) or
+              re.search(r'"code"\s*:\s*"([b\d]+)"', str(soup)))
+    if code_m:
+        code  = code_m.group(1)
+        urls1 = [f"https://www.ester.ee/iiif/2/{code}/full/500,/0/default.jpg"]
+
+        try:                                   # one avalanche JSON call
             js = requests.post(
-                "https://epik.ester.ee/api/data/getImagesByCodeList",
-                json=[code], timeout=8
-            ).json()[0]
-            if js.get("imageData"):
+                    "https://epik.ester.ee/api/data/getImagesByCodeList",
+                    json=[code], timeout=8).json()[0]
+
+            if js.get("imageData"):            # inline base-64
                 b64 = js["imageData"]
-                # if the embedded cover is crazy large (> 300 kB) prefer urlLarge
-                if len(b64) > 300_000 and (js.get("urlLarge") or js.get("urlSmall")):
-                    urls1 += [js.get("urlLarge") or js.get("urlSmall")]
+                if (len(b64) > 300_000 and
+                        (js.get("urlLarge") or js.get("urlSmall"))):
+                    urls1.append(js.get("urlLarge") or js.get("urlSmall"))
                 else:
-                    full_uri = "data:image/jpeg;base64," + b64
-                    tried.append((
-                        "data:image/jpeg;base64," + b64[:60] + "…",
-                        f"avalanche: inline base-64 ({len(b64)/1024:.0f} kB)"))
+                    _mark("avalanche/inline")
                     dbg("cover-pick", "inline base-64")
-                    return full_uri
-            urls1 += [js.get("urlLarge") or js.get("urlSmall") or ""]
+                    return "data:image/jpeg;base64," + b64
+
+            urls1.append(js.get("urlLarge") or js.get("urlSmall") or "")
+
         except Exception:
             pass
+
         if (hit := _try("avalanche/iiif", urls1)):
             dbg("cover-pick", hit)
             return hit
 
-    # ── 2. Google-Books thumb by ISBN --------------------------------
+    # ────────────────────────────────────────────────────────────────
+    #  2. Google-Books thumbnail  (ISBN)
+    # ────────────────────────────────────────────────────────────────
     isbn_list = _scrape_isbns(soup) or ([isbn_hint] if isbn_hint else [])
     urls2 = [_GOOGLE.format(i) for i in isbn_list]
     if (hit := _try("gbooks", urls2)):
         dbg("cover-pick", hit)
         return hit
 
-    # ── 3. OpenLibrary by ISBN ---------------------------------------
+    # ────────────────────────────────────────────────────────────────
+    #  3. OpenLibrary  (ISBN)
+    # ────────────────────────────────────────────────────────────────
     urls3 = [_OPENLIB.format(i) for i in isbn_list]
     if (hit := _try("openlib", urls3)):
         dbg("cover-pick", hit)
         return hit
 
-    # ── 4. Google Images “author title book cover” -------------------
+    # ────────────────────────────────────────────────────────────────
+    #  4. Google-Images fallback
+    # ────────────────────────────────────────────────────────────────
     q = f"{author} {title} book cover".strip()
-    gimg = _first_google_image(q)
-    if gimg:
+    if (gimg := _first_google_image(q)):
         if (hit := _try("gimages", [gimg])):
             dbg("cover-pick", hit)
             return hit
 
-    # ── nothing worked ----------------------------------------------
+    # ── nothing worked ------------------------------------------------
     dbg("cover-pick", "EMPTY")
-    # Dump the decision log in DEBUG mode
     if DEBUG:
         for url, verdict in tried:
-            print(f"   • {verdict:25} → {url}")
+            print(f"   • {verdict:32} → {url}")
     return ""
+
 
 def _record_brief(rec, fallback_title: str = "", isbn: str = "") -> str:
     """
@@ -1321,6 +1414,15 @@ def main():
 
     log("ℹ", "Writing cover gallery page", "cyan")
     _write_covers_page("all_covers.html")
+
+     # ── cover statistics ───────────────────────────────────────────
+    if BOOKS_WITH_COVER:
+        log("ℹ", f"Covers found: {BOOKS_WITH_COVER}/{len(titles)}", "cyan")
+        for src, n in COVER_SRC.most_common():
+            pct = n * 100 / BOOKS_WITH_COVER
+            log("•", f"{src:<15} {n:3}  ({pct:4.1f} %)", "dim")
+    else:
+        log("ℹ", "No covers were extracted", "yel")
 
     total_time = time.time() - t0
     log("⏱", f"Total time spent: {total_time:.2f}s", "yel")
