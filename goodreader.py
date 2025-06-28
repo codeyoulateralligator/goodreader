@@ -44,6 +44,7 @@ _SURNAME_CLEAN = re.compile(r"[^a-z0-9]+")
 _ERS_CACHE: dict[str, bool] = {}   # record-URL → verdict  (memo)
 COVER_SRC   : Counter[str] = Counter()   # per source “inline/og”, “gbooks”, …
 BOOKS_WITH_COVER = 0                     # total books that ended up with a cover
+GR_META: dict[str, tuple[str, str]] = {}
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -718,33 +719,32 @@ _MIN_BYTES = 1337 # Google placeholder image is about 10.5KB
 # ────────────────────────────────────────────────────────────────────
 def _write_covers_page(outfile: str = "all_covers.html") -> None:
     """
-    Build a standalone HTML gallery.
-
-    • one <figure> per book
-    • cover on top, title/author underneath – aligned in a nice grid
+    Build an HTML gallery – one <figure> per book, cover on top.
     """
     import html, re
 
-    gallery: list[tuple[str, str, str]] = []      # (surname-key, title-key, brief)
+    gallery: list[tuple[str, str, str]] = []  # (surname-key, title-key, brief)
     seen: set[str] = set()
 
     for (author, title), rec_url in RECORD_URL.items():
+        gr_author, gr_title = GR_META.get(rec_url, (author, title))
         brief = _record_brief(
             rec_url,
-            f"{author} – {title}",
-            RECORD_ISBN.get(rec_url, "")
+            f"{gr_author} – {gr_title}",
+            isbn_hint = RECORD_ISBN.get(rec_url, ""),
+            gr_author = gr_author,
+            gr_title  = gr_title
         )
         if brief in seen:
             continue
         seen.add(brief)
-        gallery.append((_surname(author), title.lower(), brief))
+        gallery.append((_surname(gr_author), gr_title.lower(), brief))
 
     if not gallery:
-        return                                      # nothing to write
+        return
 
-    gallery.sort()                                  # by surname → title
+    gallery.sort()  # by surname → title
 
-    # helper: split cached snippet into IMG + CAPTION -----------------
     IMG_RE = re.compile(r"<img[^>]+>", re.I)
 
     def split_brief(snippet: str) -> tuple[str, str]:
@@ -752,12 +752,10 @@ def _write_covers_page(outfile: str = "all_covers.html") -> None:
         if m:
             img = m.group(0)
             caption = snippet.replace(img, "", 1)
-        else:                                       # no cover at all
-            img = ""
-            caption = snippet
+        else:
+            img, caption = "", snippet
         return img, caption
 
-    # -------------------------------------------------------- emit ----
     with open(outfile, "w", encoding="utf-8") as fh:
         fh.write(
             "<!doctype html>\n<meta charset='utf-8'>\n"
@@ -774,13 +772,12 @@ def _write_covers_page(outfile: str = "all_covers.html") -> None:
             " figure img{height:220px;max-width:100%;object-fit:contain;"
             "            margin-bottom:.8rem;}\n"
             " figcaption{font-size:.9rem;line-height:1.3rem;text-align:center;}\n"
-            " a{text-decoration:none;color:#035;}\n"
+            " a{text-decoration:none;color:#035;}"
             " a:hover{text-decoration:underline;}\n"
             "</style>\n"
             "<h1>Kogu kaanekogu</h1>\n"
             "<section class='grid'>\n"
         )
-
         for _sk, _tk, brief in gallery:
             img_html, caption_html = split_brief(brief)
             fh.write("  <figure>")
@@ -789,20 +786,30 @@ def _write_covers_page(outfile: str = "all_covers.html") -> None:
                      "justify-content:center;align-items:center;"
                      "color:#666;font-size:.8rem;'>– no cover –</div>")
             fh.write(f"<figcaption>{caption_html}</figcaption></figure>\n")
-
         fh.write("</section>")
     log('✓', f"[Done] {outfile}", 'grn')
 
 
-# --- helper ----------------------------------------------------
+# ── helper: remove every "(…)" segment anywhere in the string ───────
 _PARENS = re.compile(r"\s*\([^)]*\)")
 def strip_any_parens(s: str) -> str:
-    """
-    Remove every '( … )' chunk, wherever it occurs.
-      "Ameerika agent (Mitch Rapp, #1)"  →  "Ameerika agent"
-      "Flynn, Vince (autor)"             →  "Flynn, Vince"
-    """
     return _PARENS.sub(" ", s).strip()
+
+# ── tiny helper used later ------------------------------------------
+def _split_disp(disp: str) -> tuple[str, str]:
+    """
+    Split Goodreads-style “Author – Title …” → (author, title_without_x)
+    Also removes the trailing “ (3×)” copy counter that build_map() adds.
+    """
+    if " – " in disp:
+        author, title = disp.split(" – ", 1)
+    else:
+        author, title = "", disp
+
+    # strip the “ (n×)” tail that may be present
+    title = re.sub(r"\s+\(\d+×\)$", "", title)
+    return author.strip(), title.strip()
+
 
 # ---------------------------------------------------------------------------
 #  smarter cover hunt  –  FINAL (drop-in) VERSION
@@ -950,7 +957,7 @@ def _find_cover(
     clean_author = strip_any_parens(author)
     clean_title  = strip_any_parens(title)
     q = f"{clean_author} {clean_title}".strip()
-    
+
     dbg("cover-pick", f"Google Images search: {q!r}")
     if (gimg := _first_google_image(q)):
         if (hit := _try("gimages", [gimg])):
@@ -964,85 +971,96 @@ def _find_cover(
             print(f"   • {verdict:32} → {url}")
     return ""
 
-def _record_brief(rec, *,
-                  fallback_title: str = "",
-                  isbn: str = "",
-                  gr_author: str | None = None,   # ← NEW
-                  gr_title : str | None = None):  # ← NEW
-    """
-    Return a single-line HTML snippet for Leaflet pop-ups.
+# ────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+def _record_brief(
+    rec,
+    fallback_title: str = "",
+    *,
+    isbn_hint: str = "",
+    isbn: str | None = None,
 
-    Parameters
-    ----------
-    rec            record URL • raw HTML • BeautifulSoup node
-    fallback_title already-known "Author – Title" (ASCII)
-    isbn           ISBN-13 if we have it (helps OpenLibrary fallback)
-    gr_author      clean author string from Goodreads  (optional)
-    gr_title       clean title  string from Goodreads  (optional)
+    # always arrive from process_title()
+    gr_author: str | None = None,
+    gr_title : str | None = None,
+
+    **_ignored                 # swallow anything else silently
+) -> str:
     """
-    # ── 1. fetch / parse ----------------------------------------------------
+    Build the one-liner used in pop-ups and the cover gallery.
+
+    • Always call _find_cover() with the *cleanest* strings available
+      (prefer Goodreads over catalogue).
+    • Accepts both old and new signatures.
+    """
+
+    # --- alias normalisation ----------------------------------------
+    if isbn and not isbn_hint:
+        isbn_hint = isbn
+
     soup: BeautifulSoup | None = None
-    url:  str | None           = None
+    url : str | None           = None
 
-    if hasattr(rec, "select_one"):                     # Soup / Tag
-        soup = (rec if isinstance(rec, BeautifulSoup)
-                else BeautifulSoup(str(rec), "html.parser"))
+    # --- parse the record page (if a URL was supplied) --------------
+    if hasattr(rec, "select_one"):                      # BeautifulSoup / Tag
+        soup = rec if isinstance(rec, BeautifulSoup) else BeautifulSoup(str(rec), "html.parser")
+
     elif isinstance(rec, str):
-        if rec.startswith("http"):                     # URL
+        if rec.startswith("http"):                      # URL
             url = rec
-            if url in _BRIEF_CACHE:
+            if url in _BRIEF_CACHE:                     # memoised
                 return _BRIEF_CACHE[url]
             soup = BeautifulSoup(_download(url), "html.parser")
-        else:                                          # raw HTML
+        else:                                           # raw HTML blob
             soup = BeautifulSoup(rec, "html.parser")
 
-    # ── 2. extract author / title from the ESTER page -----------------------
-    page_author = page_title = ""
+    # --- extract author/title from the record page ------------------
+    cat_title = cat_author = ""
     if soup:
-        ttl_el = (soup.select_one(".bibInfoData strong")
-                  or soup.select_one("h1.title, h2.title, td#bibTitle"))
-        aut_el = (soup.select_one(".bibInfoData a[href*='/author']")
-                  or soup.select_one(
-                        "td.bibInfoLabel:-soup-contains('Autor')+td.bibInfoData"))
-        page_title  = ttl_el.get_text(strip=True) if ttl_el else ""
-        page_author = aut_el.get_text(strip=True) if aut_el else ""
+        ttl_el = soup.select_one(".bibInfoData strong") \
+              or soup.select_one("h1.title, h2.title, td#bibTitle")
+        aut_el = soup.select_one(".bibInfoData a[href*='/author']") \
+              or soup.select_one("td.bibInfoLabel:-soup-contains('Autor')+td.bibInfoData")
+        cat_title  = ttl_el.get_text(" ", strip=True) if ttl_el else ""
+        cat_author = aut_el.get_text(" ", strip=True) if aut_el else ""
 
-    # fallbacks – make sure we always have something decent
-    title  = page_title  or (fallback_title.split(" – ", 1)[1]
-                             if " – " in fallback_title else fallback_title) or "—"
-    author = page_author
+    # --- choose the *clean* strings we’ll give to Google ------------
+    # prefer Goodreads; fall back to catalogue; last resort = fallback_title
+    nice_author = (gr_author or cat_author).strip()
+    nice_title  = (gr_title  or cat_title
+                   or (fallback_title.split(" – ", 1)[1] if " – " in fallback_title else fallback_title)
+                   or "—").strip()
 
-    # ── 3. cover hunt -------------------------------------------------------
+    # --- try to fetch a cover ---------------------------------------
     cover = ""
     if soup:
-        cover = _find_cover(
-            soup=soup,
-            author=gr_author or author,   # ★ Goodreads strings win
-            title=gr_title  or title,     # ★
-            isbn_hint=isbn
-        )
+        cover = _find_cover(soup=soup,
+                            author=nice_author,
+                            title=nice_title,
+                            isbn_hint=isbn_hint)
 
-    # If still no cover and we have an ISBN → OpenLibrary thumbnail
-    if not cover and isbn:
-        cover = _openlib_link(isbn, "M")
+    if not cover and isbn_hint:
+        cover = _openlib_link(isbn_hint, "M")            # OpenLibrary fallback
 
-    img_html = (f'<img src="{cover}" loading="lazy" '
-                f'style="height:120px;float:right;margin-left:.6em;" '
-                f'onerror="this.remove();">' if cover else "")
+    cover_html = (
+        f'<img src="{cover}" loading="lazy" '
+        f'style="height:120px;float:right;margin-left:.6em;" '
+        f'onerror="this.remove();">'
+        if cover else ""
+    )
 
-    # ── 4. compose snippet and cache ---------------------------------------
-    link_start = (f'<a href="{html.escape(url)}" target="_blank" '
-                  f'rel="noopener noreferrer">') if url else ""
+    # --- compose final fragment -------------------------------------
+    link_start = f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer">' if url else ""
     link_end   = "</a>" if url else ""
 
-    text = (f"{html.escape(gr_author or author)} – "
-            f"<em>{html.escape(gr_title or title)}</em>"
-            if gr_author or author else f"<em>{html.escape(title)}</em>")
+    text = (f"{html.escape(nice_author)} – <em>{html.escape(nice_title)}</em>"
+            if nice_author else f"<em>{html.escape(nice_title)}</em>")
 
-    brief = f"{img_html}{link_start}{text}{link_end}"
+    brief = f"{cover_html}{link_start}{text}{link_end}"
 
     if url:
         _BRIEF_CACHE[url] = brief
+
     return brief
 
 _JS_SNIPPET = r"""
@@ -1232,41 +1250,45 @@ def _openlib_link(isbn13: str, size: str = "M") -> str:
 # worker: process one Goodreads entry  (✓ now passes clean strings down)
 # ----------------------------------------------------------------------
 def process_title(idx: int, total: int,
-                  author: str, title: str, isbn: str) -> tuple[Counter, dict]:
+                  author: str, title: str, isbn: str
+                  ) -> tuple[Counter, dict]:
     """
-    • log progress
-    • call `search()` to locate a matching ESTER record
-    • gather *KOHAL* holdings for that single record
+    • Log progress
+    • Locate one matching ESTER record
+    • Gather *KOHAL* holdings for that record
+    • Memoise Goodreads metadata so later steps never need to guess
     """
     t0 = time.time()
     log(f"[{idx:3}/{total}]", f"{author} – {title}", "cyan")
     log("🔖 ISBN:", isbn or "— none —", "pur")
 
-    copies: Counter                          = Counter()
-    meta:   dict[str, tuple[str, str]]       = {}
+    copies: Counter                    = Counter()
+    meta:   dict[str, tuple[str, str]] = {}
 
     recs = search(author, title, isbn)
-    if not recs:                               # nothing matched
+    if not recs:                                  # no match at all
         log("✗", "no matching record on ESTER", "red")
         FAILED.append(f"{author} – {title}" + (f" (ISBN {isbn})"
                                                if isbn else ""))
         log("⏳", f"{time.time() - t0:.2f}s", "pur")
         return copies, meta
 
-    rec = recs[0]                              # exactly one record
+    # ── we have exactly one physical record ─────────────────────────
+    rec = recs[0]
     RECORD_URL[(author, title)] = rec
     RECORD_ISBN[rec]            = isbn or ""
+    GR_META[rec]                = (author, title)      # ← NEW, persistent
 
-    # ▶▶  pass the original Goodreads strings straight through
+    # produce (and cache) the brief – strictly with clean strings
     _record_brief(
         rec,
         fallback_title=f"{author} – {title}",
-        isbn=isbn or "",
-        gr_author=author,
-        gr_title=title
+        isbn_hint      = isbn or "",
+        gr_author      = author,
+        gr_title       = title
     )
 
-    # ── scrape holdings ─────────────────────────────────────────────
+    # ── holdings ----------------------------------------------------
     for loc, status in holdings(rec):
         name, addr = resolve(loc)
         key        = f"{name}|{addr}"
@@ -1299,7 +1321,7 @@ def build_map(lib_books, meta, coords, outfile):
         log("!", "Nothing available (KOHAL) on ESTER", "yel", err=True)
         return
 
-    # ── centre the map roughly on the mean location ────────────────
+    # ── centre map roughly on mean location ─────────────────────────
     lats = [la for la, _ in coords.values()]
     lons = [lo for _, lo in coords.values()]
     centre = (sum(lats) / len(lats), sum(lons) / len(lons))
@@ -1308,26 +1330,24 @@ def build_map(lib_books, meta, coords, outfile):
     folium.Element(
         "<style>.leaflet-popup-content{max-width:1600px;}</style>"
     ).add_to(m)
+    m.get_root().html.add_child(folium.Element(_JS_SNIPPET))  # side-panel JS
 
-    # include the JS/CSS for the “selection” side-panel
-    m.get_root().html.add_child(folium.Element(_JS_SNIPPET))
-
-    # ── iterate every library that has copies ───────────────────────
+    # ── marker per library ──────────────────────────────────────────
     for key, entries in lib_books.items():
         if key not in coords:
             continue
         lat, lon = coords[key]
         lib_name, _addr = meta[key]
 
-        # ── NEW: sort list items by author surname (case-/accent-less) ──
+        # sort by author’s surname (ASCII-folded)
         def _sort_key(entry):
             disp = entry[0] if isinstance(entry, (tuple, list)) else entry
-            author_part = disp.split("–", 1)[0].strip()      # “Lastname, Firstname”
+            author_part = disp.split("–", 1)[0].strip()
             return _surname(author_part)
 
         entries_sorted = sorted(entries, key=_sort_key)
 
-        # ── build the <li> elements (unchanged except we use entries_sorted) ──
+        # build <li> items
         lis = []
         for entry in entries_sorted:
             disp, url = (
@@ -1335,10 +1355,18 @@ def build_map(lib_books, meta, coords, outfile):
                 else (entry, "")
             )
             elem_id = _safe_id(lib_name + disp)
-            brief_html = (
-                _record_brief(url, disp, RECORD_ISBN.get(url, ""))
-                if url else html.escape(disp)
-            )
+
+            if url:
+                gr_author, gr_title = GR_META.get(url, ("", ""))
+                brief_html = _record_brief(
+                    url, disp,
+                    isbn_hint = RECORD_ISBN.get(url, ""),
+                    gr_author = gr_author,
+                    gr_title  = gr_title
+                )
+            else:
+                brief_html = html.escape(disp)
+
             brief_attr = (
                 brief_html.replace("&", "&amp;")
                           .replace('"', "&quot;")
@@ -1366,7 +1394,6 @@ def build_map(lib_books, meta, coords, outfile):
                              icon="book", prefix="fa"),
         ).add_to(m)
 
-    # ── write file ──────────────────────────────────────────────────
     m.save(outfile)
     log("✓", f"[Done] {outfile}", "grn")
 
