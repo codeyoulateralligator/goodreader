@@ -713,27 +713,6 @@ def _scrape_isbns(soup: BeautifulSoup) -> list[str]:
 
 _MIN_BYTES = 1337 # Google placeholder image is about 10.5KB
 
-def _first_good_url(urls: list[str]) -> str:
-    for u in urls:
-        try:
-            r = requests.get(u, stream=True, timeout=5,
-                             allow_redirects=True)
-            ct   = r.headers.get("Content-Type", "")
-            size = int(r.headers.get("Content-Length", 0) or 0)
-
-            dbg(f"GET {u} → {r.status_code}  {ct}  {size:,} B")
-
-            # ── NEW: skip Google-Books placeholder thumbs ───────────
-            if ("books.google.com/books/content" in u
-                    and size < 11000):
-                continue
-
-            if r.ok and ct.startswith("image") and size >= _MIN_BYTES:
-                return r.url                    # accept this one
-        except Exception as e:
-            dbg(f"Exception for URL {u}: {e}")
-    return ""
-
 # ────────────────────────────────────────────────────────────────────
 #  new _write_covers_page  –  wider tiles, caption under the jacket
 # ────────────────────────────────────────────────────────────────────
@@ -816,11 +795,14 @@ def _write_covers_page(outfile: str = "all_covers.html") -> None:
 
 
 # --- helper ----------------------------------------------------
-def _mark(src: str):
-    """Remember that *src* won the race for this book."""
-    global BOOKS_WITH_COVER
-    COVER_SRC[src] += 1
-    BOOKS_WITH_COVER += 1
+_PARENS = re.compile(r"\s*\([^)]*\)")
+def strip_any_parens(s: str) -> str:
+    """
+    Remove every '( … )' chunk, wherever it occurs.
+      "Ameerika agent (Mitch Rapp, #1)"  →  "Ameerika agent"
+      "Flynn, Vince (autor)"             →  "Flynn, Vince"
+    """
+    return _PARENS.sub(" ", s).strip()
 
 # ---------------------------------------------------------------------------
 #  smarter cover hunt  –  FINAL (drop-in) VERSION
@@ -964,7 +946,12 @@ def _find_cover(
     # ────────────────────────────────────────────────────────────────
     #  4. Google-Images fallback
     # ────────────────────────────────────────────────────────────────
-    q = f"{author} {title} book cover".strip()
+    # q = f"{author} {title} book cover".strip()
+    clean_author = strip_any_parens(author)
+    clean_title  = strip_any_parens(title)
+    q = f"{clean_author} {clean_title}".strip()
+    
+    dbg("cover-pick", f"Google Images search: {q!r}")
     if (gimg := _first_google_image(q)):
         if (hit := _try("gimages", [gimg])):
             dbg("cover-pick", hit)
@@ -977,82 +964,85 @@ def _find_cover(
             print(f"   • {verdict:32} → {url}")
     return ""
 
+def _record_brief(rec, *,
+                  fallback_title: str = "",
+                  isbn: str = "",
+                  gr_author: str | None = None,   # ← NEW
+                  gr_title : str | None = None):  # ← NEW
+    """
+    Return a single-line HTML snippet for Leaflet pop-ups.
 
-def _record_brief(rec, fallback_title: str = "", isbn: str = "") -> str:
+    Parameters
+    ----------
+    rec            record URL • raw HTML • BeautifulSoup node
+    fallback_title already-known "Author – Title" (ASCII)
+    isbn           ISBN-13 if we have it (helps OpenLibrary fallback)
+    gr_author      clean author string from Goodreads  (optional)
+    gr_title       clean title  string from Goodreads  (optional)
     """
-    Return a one-liner HTML fragment for use inside the Leaflet pop-up.
-    • *rec* may be  – record-URL  |  raw HTML  |  BeautifulSoup node
-    • *fallback_title* is the plain “Author – Title” string you already know
-    • *isbn* lets _find_cover() and the OpenLibrary fallback try ISBN routes
-    """
-    # ── 1. get / parse the record page ───────────────────────────────
+    # ── 1. fetch / parse ----------------------------------------------------
     soup: BeautifulSoup | None = None
-    url: str | None            = None
+    url:  str | None           = None
 
-    if hasattr(rec, "select_one"):               # soup or Tag
+    if hasattr(rec, "select_one"):                     # Soup / Tag
         soup = (rec if isinstance(rec, BeautifulSoup)
                 else BeautifulSoup(str(rec), "html.parser"))
-
     elif isinstance(rec, str):
-        if rec.startswith("http"):               # URL
+        if rec.startswith("http"):                     # URL
             url = rec
-            if url in _BRIEF_CACHE:              # memoised → done
+            if url in _BRIEF_CACHE:
                 return _BRIEF_CACHE[url]
-
             soup = BeautifulSoup(_download(url), "html.parser")
-        else:                                    # raw HTML
+        else:                                          # raw HTML
             soup = BeautifulSoup(rec, "html.parser")
 
-    # ── 2. extract title / author (fallbacks keep page usable) ───────
-    title = author = ""
+    # ── 2. extract author / title from the ESTER page -----------------------
+    page_author = page_title = ""
     if soup:
         ttl_el = (soup.select_one(".bibInfoData strong")
                   or soup.select_one("h1.title, h2.title, td#bibTitle"))
         aut_el = (soup.select_one(".bibInfoData a[href*='/author']")
                   or soup.select_one(
                         "td.bibInfoLabel:-soup-contains('Autor')+td.bibInfoData"))
-        title  = ttl_el.get_text(strip=True) if ttl_el else ""
-        author = aut_el.get_text(strip=True) if aut_el else ""
+        page_title  = ttl_el.get_text(strip=True) if ttl_el else ""
+        page_author = aut_el.get_text(strip=True) if aut_el else ""
 
-    if not title:                                # last-ditch fallback
-        title = (fallback_title.split(" – ", 1)[1]
-                 if " – " in fallback_title else fallback_title or "—")
+    # fallbacks – make sure we always have something decent
+    title  = page_title  or (fallback_title.split(" – ", 1)[1]
+                             if " – " in fallback_title else fallback_title) or "—"
+    author = page_author
 
-    # ── 3. cover hunt ────────────────────────────────────────────────
+    # ── 3. cover hunt -------------------------------------------------------
     cover = ""
     if soup:
         cover = _find_cover(
             soup=soup,
-            author=author,
-            title=title,
+            author=gr_author or author,   # ★ Goodreads strings win
+            title=gr_title  or title,     # ★
             isbn_hint=isbn
         )
 
-    # **only** if nothing worked above, try OpenLibrary by ISBN
+    # If still no cover and we have an ISBN → OpenLibrary thumbnail
     if not cover and isbn:
-        cover = _openlib_link(isbn, "M")     # ?default=false is in helper
+        cover = _openlib_link(isbn, "M")
 
-    # <img> with auto-vanish on 4xx/403 etc.
-    cover_html = (
-        f'<img src="{cover}" loading="lazy" '
-        f'style="height:120px;float:right;margin-left:.6em;" '
-        f'onerror="this.remove();">'
-        if cover else ""
-    )
+    img_html = (f'<img src="{cover}" loading="lazy" '
+                f'style="height:120px;float:right;margin-left:.6em;" '
+                f'onerror="this.remove();">' if cover else "")
 
-    # ── 4. compose final snippet & memoise ───────────────────────────
+    # ── 4. compose snippet and cache ---------------------------------------
     link_start = (f'<a href="{html.escape(url)}" target="_blank" '
                   f'rel="noopener noreferrer">') if url else ""
     link_end   = "</a>" if url else ""
 
-    text = (f"{html.escape(author)} – <em>{html.escape(title)}</em>"
-            if author else f"<em>{html.escape(title)}</em>")
+    text = (f"{html.escape(gr_author or author)} – "
+            f"<em>{html.escape(gr_title or title)}</em>"
+            if gr_author or author else f"<em>{html.escape(title)}</em>")
 
-    brief = f"{cover_html}{link_start}{text}{link_end}"
+    brief = f"{img_html}{link_start}{text}{link_end}"
 
     if url:
         _BRIEF_CACHE[url] = brief
-
     return brief
 
 _JS_SNIPPET = r"""
@@ -1238,34 +1228,45 @@ def _openlib_link(isbn13: str, size: str = "M") -> str:
     )   
 
 # ─── worker ──────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
+# worker: process one Goodreads entry  (✓ now passes clean strings down)
+# ----------------------------------------------------------------------
 def process_title(idx: int, total: int,
                   author: str, title: str, isbn: str) -> tuple[Counter, dict]:
     """
     • log progress
-    • call `search()`
-    • collect *KOHAL* holdings for the (single) matching record
+    • call `search()` to locate a matching ESTER record
+    • gather *KOHAL* holdings for that single record
     """
     t0 = time.time()
     log(f"[{idx:3}/{total}]", f"{author} – {title}", "cyan")
     log("🔖 ISBN:", isbn or "— none —", "pur")
 
-    copies: Counter                   = Counter()
-    meta:   dict[str, tuple[str, str]] = {}
+    copies: Counter                          = Counter()
+    meta:   dict[str, tuple[str, str]]       = {}
 
     recs = search(author, title, isbn)
-    if not recs:                                      # zero matches
+    if not recs:                               # nothing matched
         log("✗", "no matching record on ESTER", "red")
         FAILED.append(f"{author} – {title}" + (f" (ISBN {isbn})"
                                                if isbn else ""))
         log("⏳", f"{time.time() - t0:.2f}s", "pur")
         return copies, meta
 
-    rec = recs[0]                                     # exactly one
+    rec = recs[0]                              # exactly one record
     RECORD_URL[(author, title)] = rec
     RECORD_ISBN[rec]            = isbn or ""
-    _record_brief(rec, f"{author} – {title}", isbn or "")
 
-    # ── holdings ------------------------------------------------------------
+    # ▶▶  pass the original Goodreads strings straight through
+    _record_brief(
+        rec,
+        fallback_title=f"{author} – {title}",
+        isbn=isbn or "",
+        gr_author=author,
+        gr_title=title
+    )
+
+    # ── scrape holdings ─────────────────────────────────────────────
     for loc, status in holdings(rec):
         name, addr = resolve(loc)
         key        = f"{name}|{addr}"
@@ -1281,8 +1282,8 @@ def process_title(idx: int, total: int,
         "grn" if tot else "red")
 
     if not tot:
-        FAILED.append(f"{author} – {title}"
-                      + (f" (ISBN {isbn})" if isbn else ""))
+        FAILED.append(f"{author} – {title}" + (f" (ISBN {isbn})"
+                                               if isbn else ""))
 
     log("⏳", f"{time.time() - t0:.2f}s", "pur")
     return copies, meta
