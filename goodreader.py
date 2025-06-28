@@ -19,6 +19,7 @@ import hashlib
 import urllib.parse as _uparse
 from urllib3.util.retry import Retry
 from requests.adapters   import HTTPAdapter
+from metaphone import doublemetaphone
 
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
@@ -192,73 +193,58 @@ def parse_web_shelf(uid: str, limit: int | None):
         page += 1
     return out
 
-# ─── put this near the other helpers ──────────────────────────────
+# 1. **single-char** fixes that can go into translate()
+_DEFANG = str.maketrans({
+    "ё": "o",
+    "œ": "o",
+})
+
+# 2. **multi-char** substitutions – keep them here, apply with .replace()
+_MULTI = {
+    "oe": "o",           # Dost**oe**v–
+    "yo": "o", "jo": "o", "io": "o",
+    "ya": "a", "ja": "a",
+}
+
+# cheap clean-ups
+_SK_FAMILY  = re.compile(r"(sky|ski|skij|skyi)$")   # –ski → –sk
+_DBL_LETTER = re.compile(r"(.)\1+")                 # collapse doubles
+_NONAZ      = re.compile(r"[^a-z]")                 # drop non-letters
+
 def _canon_name(token: str) -> str:
     """
-    Give a *lossy but stable* ASCII fingerprint for one surname token so that
-    the countless spellings of the same Slavic/Baltic name collapse to the
-    **same** string.
+    Return **one short ASCII fingerprint** for any Slavic/Baltic surname:
+        • normalise diacritics/umlauts
+        • fold common multi-graph variants  (ё/oe/yo …)
+        • collapse double letters, -ski → -sk, …
+        • finally → Double Metaphone → first code  (eg. 'KRMST' for Karamazov)
 
-    Example collapses
-    -----------------
-        Aleksijevitš  →  alexivich
-        Alexievits    →  alexivich
-        Alexievich    →  alexivich
-        Alexivich     →  alexivich   (already canonical)
-
-    Pipeline
-    --------
-      0. lower-case
-      1. digraph fixes that still carry diacritics   (tš→ch, dž→j, …)
-      2. ASCII-fold remaining diacritics/umlauts
-      3. cheap phonetic conflations                 (ks→x, hh→kh, j→y)
-      4. collapse   double letters
-      4½.   -vits / -ievits / -yevits   →   -vich
-      5. glide simplifications           yi/iy/ie/ye  →  i
-      6. drop trailing i/y glides
-      7. strip everything that is *not* a–z
+    If Metaphone yields an empty string (rare), fall back to the
+    stripped-ASCII version instead.
     """
-    # ── 0. lower-case ────────────────────────────────────────────────
     s = token.lower()
 
-    # ── 1. digraphs with diacritics (before ASCII-fold!) ─────────────
-    s = (s.replace("tš", "ch")
-           .replace("dž", "j"))
+    # NEW ❶: neutralise -jev-/-jov- glides before anything else
+    s = re.sub(r"[jy][eo]v", "ev", s)    # jev / jov → ev
 
-    # ── 2. ASCII-fold: map the few Estonian diacritics we meet ───────
-    _TR = str.maketrans({
-        "š": "sh", "ž": "zh",
-        "õ": "o",  "ä": "a",
-        "ö": "o",  "ü": "u",
-    })
-    s = s.translate(_TR)
+    # 0. apply multi-char replacements first
+    for pat, repl in _MULTI.items():
+        s = s.replace(pat, repl)
 
-    # ── 3. coarse phonetic conflations ───────────────────────────────
-    s = (s.replace("ks", "x")      # Aleks → Alex
-           .replace("hh", "kh")
-           .replace("j", "y"))     # Иван → Ivan-y (й → y)
+    # 1. one-char translate
+    s = s.translate(_DEFANG)
 
-    # ── 4. collapse runs of doubled letters ──────────────────────────
-    s = re.sub(r"(.)\1+", r"\1", s)
+    # 2. ASCII-fold the rest of the diacritics
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
 
-    # ── 4½. *-vits / -ievits / -yevits* → *-vich*  (most common case) ─
-    s = re.sub(r"(?:[iey]?v)its$", "vich", s)
+    # 3. cheap conflations
+    s = _SK_FAMILY.sub("sk", s)          # Dostojevski  →  Dostojevsk
+    s = _DBL_LETTER.sub(r"\1", s)        # kk → k,   yy → y
+    s = _NONAZ.sub("", s)                # only [a-z]
 
-    # ── 5. glide simplifications  (yi/iy/ie/ye → i) ──────────────────
-    #     This erases the e/ы difference responsible for
-    #     Alexievich   vs  Alexivich    &c.
-    s = (s.replace("yi", "i")
-           .replace("iy", "i")
-           .replace("ie", "i")
-           .replace("ye", "i"))
-
-    # ── 6. kill any leftover trailing i/y glide ──────────────────────
-    s = re.sub(r"[iy]+$", "", s)
-
-    # ── 7. allow only plain ASCII letters in the final key ───────────
-    s = re.sub(r"[^a-z]", "", s)
-
-    return s
+    # 4. Double Metaphone
+    code = doublemetaphone(s)[0]
+    return code or s                     # safety fallback
 
 _FRSCRUB = re.compile(r"""
      (?:&\d+(?:,\d+)*,?$)                 # tail like “…&1,1,” or “…&0,0,”
@@ -506,12 +492,15 @@ def _is_eresource(rec_url: str) -> bool:
 # ---------------------------------------------------------------------
 def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
     """
-    Decide whether the ESTER record behind *rec_url* is the same book as
-    (*w_ttl* /*w_aut*).  Returns True for a match.
+    Decide whether the ESTER record at *rec_url* is the same book as
+    (*w_ttl* / *w_aut*).  Returns True on a confident match.
+
+    • Title  → need every word present in the record’s title
+    • Author → compare canonicalised surname fingerprints
     """
-    # 1. pull title / author from the record page ---------------------
+    # 1. pull record title / author ----------------------------------
     r_ttl, r_aut = _ester_fields(rec_url)
-    if not r_ttl:                        # fetch / parse failed
+    if not r_ttl:                     # fetch or parse failed
         return False
 
     # 2. tokenise -----------------------------------------------------
@@ -519,20 +508,19 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
     record_toks = _tokenise(r_ttl) | _tokenise(r_aut)
 
     # ---- TITLE test -------------------------------------------------
-    ttl_ok = wanted_toks <= record_toks            # need *all* wanted words
+    ttl_ok = wanted_toks <= record_toks
 
-    # ---- AUTHOR test (new) ------------------------------------------
-    # a) take the surname part(s) of the wanted author
-    surname_raw   = _surname(w_aut)                # “Aleksijevitš” etc.
-    surname_parts = _tokenise(surname_raw)         # {'aleksijevits'}
+    # ---- AUTHOR test -----------------------------------------------
+    surname_raw   = _surname(w_aut)            # e.g. “Dostoevsky”
+    surname_parts = _tokenise(surname_raw)     # {'dostoevsky'} or ∅
 
-    # b) canonicalise both sides to tolerate Aleksijevitš ↔ Alexievich
     wanted_canon  = {_canon_name(p) for p in surname_parts}
     record_canon  = {_canon_name(t) for t in record_toks}
 
-    auth_ok = not surname_parts or wanted_canon <= record_canon
+    auth_ok = (not surname_parts               # if no author given, skip test
+               or wanted_canon <= record_canon)
 
-    # ---- DEBUG dump (unchanged) -------------------------------------
+    # ---- VERBOSE dump ----------------------------------------------
     if DEBUG:
         print("┌─  title/author comparator ──────────────────────────────────────")
         print(f"│  record URL      : {rec_url}")
@@ -545,12 +533,11 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
         print(f"│  surname parts   : {sorted(surname_parts)}")
         print(f"│  canon wanted    : {sorted(wanted_canon)}")
         print(f"│  canon record    : {sorted(record_canon)}")
-        verdict = 'MATCH' if ttl_ok and auth_ok else 'SKIP'
-        colour  = 'grn' if verdict == 'MATCH' else 'red'
+        verdict = "MATCH" if (ttl_ok and auth_ok) else "SKIP"
+        colour  = "grn"  if verdict == "MATCH"   else "red"
         print(f"└── verdict: {CLR[colour]}{verdict}{CLR['reset']}\n")
 
     return ttl_ok and auth_ok
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Helper: pretty-print one (loc, status) pair
