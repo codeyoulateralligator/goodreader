@@ -1,7 +1,6 @@
-
-beautifulsoup4
-folium
-geopy
-metaphone
-requests
-
+requests>=2.31
+folium>=0.15
+beautifulsoup4>=4.12
+geopy>=2.4
+urllib3>=2.2
+Metaphone>=0.6

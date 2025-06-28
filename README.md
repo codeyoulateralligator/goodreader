@@ -5,7 +5,8 @@ Turn your **Goodreads “To‑Read” shelf** into an **interactive map** of eve
 physical copy held by Estonian libraries – complete with cover thumbnails,  
 availability status (*KOHAL / TÄHTAEG*) and a side‑panel “shopping list”.
 
-![Screenshot of the generated Folium map](docs/screenshot-map.png)
+![Screenshot of the generated Folium map](docs/kogu1.png)
+![Screenshot of the generated Folium map](docs/kogu2.png)
 
 ---
 
@@ -27,12 +28,12 @@ availability status (*KOHAL / TÄHTAEG*) and a side‑panel “shopping list”.
 ```bash
 git clone https://github.com/your-nick/goodreads-ester-mapper.git
 cd goodreads-ester-mapper
-python -m venv venv
-source venv/bin/activate
+python -m venv gr
+source gr/bin/activate
 pip install -r requirements.txt
 ```
 
-Python 3.10 + recommended (pattern‑matching & modern typing).
+Python 3.10+ recommended (pattern‑matching & modern typing).
 
 ---
 
@@ -43,7 +44,7 @@ Python 3.10 + recommended (pattern‑matching & modern typing).
 ./goodreader.py --goodreads-csv my_to_read.csv
 
 # 2) Using a public Goodreads shelf (no CSV needed)
-./goodreader.py --goodreads-user XXXXXXXXX
+./goodreader.py --goodreads-user XXXXXXXXX # 👈 replace with *your* user-id
 ```
 
 Open **`want_to_read_map.html`** in your browser and start exploring.  

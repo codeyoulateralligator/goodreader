@@ -39,6 +39,8 @@ soupsieve==2.7
 typing-extensions==4.14.0
     # via beautifulsoup4
 urllib3==2.5.0
-    # via requests
+    # via
+    #   -r requirements.in
+    #   requests
 xyzservices==2025.4.0
     # via folium
