@@ -33,15 +33,16 @@ def dbg(tag, msg="", col="red"):
     if DEBUG:
         log(tag, msg, col)
 
-FAILED: List[str] = []                 # titles with zero *KOHAL*
+NOT_FOUND: List[str] = []                # search returned zero records
+NO_KOHAL:  List[str] = []                # record exists, but 0 × KOHAL
 HTML_CACHE: dict[str, str] = {}
 RECORD_URL: dict[tuple[str, str], str] = {}
 RECORD_BRIEF: dict[str, str] = {}
-RECORD_ISBN: dict[str, str] = {}       # record-url  →  isbn13
-_BRIEF_CACHE: dict[str, str] = {} 
-_ID_SEEN: set[str] = set()
-_SURNAME_CLEAN = re.compile(r"[^a-z0-9]+")
-_ERS_CACHE: dict[str, bool] = {}   # record-URL → verdict  (memo)
+RECORD_ISBN: dict[str, str] = {}         # record-url  →  isbn13
+BRIEF_CACHE: dict[str, str] = {} 
+ID_SEEN: set[str] = set()
+SURNAME_CLEAN = re.compile(r"[^a-z0-9]+")
+ERS_CACHE: dict[str, bool] = {}          # record-URL → verdict  (memo)
 COVER_SRC   : Counter[str] = Counter()   # per source “inline/og”, “gbooks”, …
 BOOKS_WITH_COVER = 0                     # total books that ended up with a cover
 GR_META: dict[str, tuple[str, str]] = {}
@@ -140,9 +141,9 @@ def _surname(author: str) -> str:
     if "," in a:                                   # standard “Last, First”
         last = a.split(",", 1)[0]
     else:                                          # “First Last …”
-        parts = _SURNAME_CLEAN.split(a)
+        parts = SURNAME_CLEAN.split(a)
         last = parts[-1] if parts else a
-    return _SURNAME_CLEAN.sub("", last)            # purge leftovers
+    return SURNAME_CLEAN.sub("", last)            # purge leftovers
 
 # ─── Goodreads CSV loader ────────────────────────────────────────────
 def gd_csv(path: pathlib.Path, limit: int | None):
@@ -466,10 +467,10 @@ def _is_eresource(rec_url: str) -> bool:
       – the record page shows *no* holdings table **and**
       – at least one string from `_ERS_TAGS` occurs in the HTML.
 
-    (Uses `_ERS_CACHE` for memoisation.)
+    (Uses `ERS_CACHE` for memoisation.)
     """
-    if rec_url in _ERS_CACHE:             # memoised result → instant
-        return _ERS_CACHE[rec_url]
+    if rec_url in ERS_CACHE:             # memoised result → instant
+        return ERS_CACHE[rec_url]
 
     html = _download(rec_url)             # your existing cached GET
     soup = BeautifulSoup(html, 'html.parser')
@@ -478,13 +479,13 @@ def _is_eresource(rec_url: str) -> bool:
         soup.select_one("tr.bibItemsEntry, tr[class*=bibItemsEntry]")
     )
     if has_physical:
-        _ERS_CACHE[rec_url] = False
+        ERS_CACHE[rec_url] = False
         dbg("_is_eresource", f"{rec_url} → False (physical holdings present)")
         return False
 
     page_lc = html.lower()
     eres    = any(tag.lower() in page_lc for tag in _ERS_TAGS)
-    _ERS_CACHE[rec_url] = eres
+    ERS_CACHE[rec_url] = eres
     dbg("_is_eresource", f"{rec_url} → {eres}")
     return eres
 
@@ -501,6 +502,7 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
     """
     # 1. pull record title / author ----------------------------------
     r_ttl, r_aut = _ester_fields(rec_url)
+    dbg(f"Ester author/title: {r_aut!r} - {r_ttl!r}")
     if not r_ttl:                     # fetch or parse failed
         return False
 
@@ -669,12 +671,12 @@ def _safe_id(raw: str) -> str:
         slug = 'id-' + hashlib.md5(raw.encode()).hexdigest()[:8]
 
     # 2. ensure uniqueness
-    if slug in _ID_SEEN:
+    if slug in ID_SEEN:
         base, n = slug, 2
-        while f"{base}-{n}" in _ID_SEEN:
+        while f"{base}-{n}" in ID_SEEN:
             n += 1
         slug = f"{base}-{n}"
-    _ID_SEEN.add(slug)
+    ID_SEEN.add(slug)
     return slug
     
 _BAD_IMG_PAT = re.compile(r'(?i)(/screens/|spinner|transparent\.gif|\.svg$)')
@@ -1008,8 +1010,8 @@ def _record_brief(
     elif isinstance(rec, str):
         if rec.startswith("http"):                      # URL
             url = rec
-            if url in _BRIEF_CACHE:                     # memoised
-                return _BRIEF_CACHE[url]
+            if url in BRIEF_CACHE:                     # memoised
+                return BRIEF_CACHE[url]
             soup = BeautifulSoup(_download(url), "html.parser")
         else:                                           # raw HTML blob
             soup = BeautifulSoup(rec, "html.parser")
@@ -1059,7 +1061,7 @@ def _record_brief(
     brief = f"{cover_html}{link_start}{text}{link_end}"
 
     if url:
-        _BRIEF_CACHE[url] = brief
+        BRIEF_CACHE[url] = brief
 
     return brief
 
@@ -1253,33 +1255,49 @@ def process_title(idx: int, total: int,
                   author: str, title: str, isbn: str
                   ) -> tuple[Counter, dict]:
     """
-    • Log progress
-    • Locate one matching ESTER record
-    • Gather *KOHAL* holdings for that record
-    • Memoise Goodreads metadata so later steps never need to guess
+    • Log progress for the *idx/total*-th Goodreads entry
+    • Locate *one* matching ESTER record (if any)
+    • Collect the number of holdings whose status string contains “KOHAL”
+    • Return:
+        copies  – Counter keyed by (author, title, "lib|addr") → count
+        meta    – { "lib|addr" → (pretty_library_name, address) }
+
+    Side-effects
+    ------------
+    • Populates the global dicts RECORD_URL, RECORD_ISBN and GR_META
+      (used elsewhere for pop-ups and the cover gallery)
+    • Appends a descriptive line to NOT_FOUND  or  NO_KOHAL
+      so the caller can print the two lists separately.
     """
+    global NOT_FOUND, NO_KOHAL
+
     t0 = time.time()
     log(f"[{idx:3}/{total}]", f"{author} – {title}", "cyan")
     log("🔖 ISBN:", isbn or "— none —", "pur")
 
-    copies: Counter                    = Counter()
-    meta:   dict[str, tuple[str, str]] = {}
+    copies: Counter = Counter()
+    meta:   dict    = {}
 
+    # ── ①  look for a matching record on ESTER ──────────────────────
     recs = search(author, title, isbn)
-    if not recs:                                  # no match at all
-        log("✗", "no matching record on ESTER", "red")
-        FAILED.append(f"{author} – {title}" + (f" (ISBN {isbn})"
-                                               if isbn else ""))
-        log("⏳", f"{time.time() - t0:.2f}s", "pur")
-        return copies, meta
 
-    # ── we have exactly one physical record ─────────────────────────
+    # ………………………………………………………………………………………………………………………………
+    #  A.  **nothing** found → NOT_FOUND
+    # ………………………………………………………………………………………………………………………………
+    if not recs:
+        log("✗", "no matching record on ESTER", "red")
+        line = f"{author} – {title}" + (f" (ISBN {isbn})" if isbn else "")
+        NOT_FOUND.append(line)
+        log("⏳", f"{time.time() - t0:.2f}s", "pur")
+        return copies, meta          # empty
+
+    # we have exactly one physical record URL
     rec = recs[0]
     RECORD_URL[(author, title)] = rec
     RECORD_ISBN[rec]            = isbn or ""
-    GR_META[rec]                = (author, title)      # ← NEW, persistent
+    GR_META[rec]                = (author, title)      # for later pop-ups
 
-    # produce (and cache) the brief – strictly with clean strings
+    # cache the brief (so later steps don’t need to fetch again)
     _record_brief(
         rec,
         fallback_title=f"{author} – {title}",
@@ -1288,7 +1306,7 @@ def process_title(idx: int, total: int,
         gr_title       = title
     )
 
-    # ── holdings ----------------------------------------------------
+    # ── ②  scrape holdings → count “KOHAL” copies ───────────────────
     for loc, status in holdings(rec):
         name, addr = resolve(loc)
         key        = f"{name}|{addr}"
@@ -1299,13 +1317,16 @@ def process_title(idx: int, total: int,
         meta[key] = (name, addr)
 
     tot = sum(copies.values())
-    log("✓" if tot else "✗",
-        f"{tot} × KOHAL" if tot else "0 × KOHAL",
-        "grn" if tot else "red")
 
-    if not tot:
-        FAILED.append(f"{author} – {title}" + (f" (ISBN {isbn})"
-                                               if isbn else ""))
+    # ………………………………………………………………………………………………………………………………
+    #  B.  record exists, but *zero* “KOHAL” → NO_KOHAL
+    # ………………………………………………………………………………………………………………………………
+    if tot == 0:
+        log("✗", "0 × KOHAL", "red")
+        line = f"{author} – {title}" + (f" (ISBN {isbn})" if isbn else "")
+        NO_KOHAL.append(line)
+    else:
+        log("✓", f"{tot} × KOHAL", "grn")
 
     log("⏳", f"{time.time() - t0:.2f}s", "pur")
     return copies, meta
@@ -1448,10 +1469,17 @@ def main():
     if coords: GEOCACHE.write_text(json.dumps(cache,indent=2,ensure_ascii=False))
     build_map(lib_books,meta,coords,a.output)
 
-    if FAILED:
-        log("\n=== TITLES WITH NO *KOHAL* COPIES ===","","red")
-        for line in FAILED: log("✗",line,"red")
-        log(f"Total missing: {len(FAILED)}","","red")
+    if NOT_FOUND:
+        log("\n=== TITLES **NOT FOUND** ON ESTER ===", "", "red")
+        for line in NOT_FOUND:
+            log("✗", line, "red")
+        log(f"Total not-found: {len(NOT_FOUND)}", "", "red")
+
+    if NO_KOHAL:
+        log("\n=== TITLES FOUND, BUT WITH **NO KOHAL COPIES** ===", "", "yel")
+        for line in NO_KOHAL:
+            log("•", line, "yel")
+        log(f"Total no-KOHAL: {len(NO_KOHAL)}", "", "yel")
 
     log("ℹ", "Writing cover gallery page", "cyan")
     _write_covers_page("all_covers.html")
