@@ -4,8 +4,8 @@ Turn your **Goodreads “To‑Read” shelf** into an **interactive map** of eve
 physical copy held by Estonian libraries – complete with cover thumbnails,  
 availability status (*KOHAL / TÄHTAEG*) and a side‑panel “shopping list”.
 
-![Screenshot of the generated Folium map](docs/kogu1.jpg)
-![Screenshot of the generated Folium map](docs/kogu2.jpg)
+![Screenshot of the generated Folium map](docs/kogu1.png)
+![Screenshot of the generated Folium map](docs/kogu2.png)
 
 ---
 
