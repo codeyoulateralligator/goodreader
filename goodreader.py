@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-goodreads_ester_mapper.py 🇪🇪📚
-Build b-32 • 2025-07-02
+goodreader.py 🇪🇪📚
+Build b-33 • 29-06-2025
+github.com/codeyoulateralligator
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ _WHITES = re.compile(r"\s{2,}")
 def log(tag, msg, col="dim", err=False):
     stream = sys.stderr if err or DEBUG else sys.stdout
     print(f"{CLR[col]}{tag}{CLR['reset']} {msg}", file=stream, flush=True)
-def dbg(tag, msg="", col="red"):
+def dbg(tag, msg="", col="cyan"):
     if DEBUG:
         log(tag, msg, col)
 
@@ -279,62 +280,85 @@ def _canon(url: str) -> str:
     # non-frameset: ignore ?params entirely
     return _uparse.urlunsplit((s.scheme, s.netloc, path, "", ""))
 
-_MAX_VISITED = 60
+_MAX_VISITED = 13
 _BAD_LEADS = (
     "/clientredirect", "/patroninfo~", "/validate/patroninfo",
     "/requestmulti~",  "/mylistsmulti", "/logout",
 
     # “Save record” noise produced by Sierra/ESTER
-    "?save=",         #  ← NEW  (was only “&save=”)
+    "?save=",
     "&save=",
-    "?saved=",        #  ← NEW
+    "?saved=",
     "&saved=",
-    "?clear_saves=",  #  ← NEW
+    "?clear_saves=",
     "&clear_saves=",
-    "/frameset&save",     # old variant
+    "/frameset&save",
     "?save_func=",
 )
 
-def collect_record_links(start_url: str) -> list[str]:
+# ────────────────────────────────────────────────────────────────────
+# NEW  collect_record_links  – gather *all* physical records
+# ────────────────────────────────────────────────────────────────────
+def collect_record_links(start_url: str,
+                         limit: int | None = None) -> list[str]:
     """
-    Breadth-first crawl starting at *start_url* and return the **first**
-    physical ESTER record link (``.../record=bNNNNNNN~S8*est``) encountered.
+    Crawl from *start_url* (frameset or plain list) and return physical-copy
+    record URLs (books only).  Each candidate link is logged exactly once with
+    an “accepted / rejected (reason)” verdict so the debug stream is easy to
+    read.
 
-    The walk stops as soon as one such link is found or after the safety
-    limit of 60 distinct pages has been reached.
+    Reasons that can appear:
 
-    Links whose URL matches anything in the `_BAD_LEADS` blacklist are
-    skipped immediately – they are patron-session / redirect boiler-plate
-    that can never contain holdings pages and often lead to infinite loops.
+        + physical     – kept in the results list
+        e-resource     – has only e-copies, skipped
+        non-book       – DVD / CD / etc., skipped
+        duplicate      – we have already stored this record
     """
     q: deque[str] = deque([start_url])
-    seen: set[str] = set()
+    seen_pages: set[str] = set()
+    out: list[str] = []
+
+    # helper to print a coloured verdict line ------------------------
+    def _verdict(rec: str, tag: str) -> None:
+        colour = {
+            "+ physical": "grn",
+            "duplicate":  "red",
+            "e-resource": "red",
+            "non-book":   "red",
+        }.get(tag, "dim")
+        dbg("collect", f"{tag:>12}  {rec}", colour)
 
     while q:
         url = q.popleft()
         key = _canon(url)
-        if key in seen:
+        if key in seen_pages:
             continue
-        seen.add(key)
+        seen_pages.add(key)
 
-        dbg("collect open", url)
+        dbg("collect open", url, "cyan")
         soup = BeautifulSoup(_download(url), "html.parser")
 
-        # ── 1. harvest record links already on this page ─────────────
+        # 1. harvest record links on this page -----------------------
         for a in soup.select('a[href*="/record=b"]'):
             rec = _uparse.urljoin(url, a["href"])
+
             if _is_eresource(rec):
-                dbg("collect", f"    skip E-RES {rec}")
+                _verdict(rec, "e-resource")
+                continue
+            if _is_nonbook(rec):
+                _verdict(rec, "non-book")
+                continue
+            if rec in out:
+                _verdict(rec, "duplicate")
                 continue
 
-            if _is_nonbook(rec):                   # new non-book guard
-                dbg("collect", f"    skip NON-BOOK {rec}")
-                continue
+            out.append(rec)
+            _verdict(rec, "+ physical")
 
-            dbg("collect", f"    ✓ physical {rec}")
-            return [rec]                        # ← EARLY EXIT
+            if limit and len(out) >= limit:
+                return out                       # early stop after N accepted
 
-        # ── 2. enqueue inner documents (framesets / iframes) ─────────
+        # 2. enqueue inner “frameset / iframe” documents -------------
         leads = (
             [f["href"] for f in soup.select('a[href*="/frameset"]')] +
             [f["src"]  for f in soup.select('frame[src], iframe[src]')]
@@ -344,23 +368,17 @@ def collect_record_links(start_url: str) -> list[str]:
             if not l:
                 continue
             nxt = _uparse.urljoin(url, l)
-
-            # skip anything on the do-not-touch list
             if any(bad in nxt or nxt.startswith(bad) for bad in _BAD_LEADS):
-                dbg("collect", f"    skip bad-lead {nxt[:80]}")
                 continue
-
-            if _canon(nxt) in seen:
+            if _canon(nxt) in seen_pages:
                 continue
-            if len(seen) >= _MAX_VISITED:
-                dbg("collect", "    abort – visited>60")
-                break
-
+            if len(seen_pages) >= _MAX_VISITED:
+                dbg("collect", f"    abort – visited>{_MAX_VISITED}", "red")
+                return out
             q.append(nxt)
-            dbg("collect", f"    add lead {nxt}")
 
-    dbg("collect", "    ∅ 0 physical copies")
-    return []
+    return out
+
 
 # ─── tokenisers / surname helper ─────────────────────────────────────
 _norm_re=re.compile(r"[^a-z0-9]+")
@@ -370,7 +388,6 @@ def _surname(a):    # supports “Lastname, Firstname”
     if "," in a: return _ascii_fold(a.split(",",1)[0]).split()[0]
     p=_ascii_fold(a).split(); return p[-1] if p else ""
 
-# ─── HTTP download (cached) ──────────────────────────────────────────
 # ─── HTTP download (cached + retry) ─────────────────────────────────
 SESSION = requests.Session()
 
@@ -480,13 +497,11 @@ def _is_eresource(rec_url: str) -> bool:
     )
     if has_physical:
         ERS_CACHE[rec_url] = False
-        dbg("_is_eresource", f"{rec_url} → False (physical holdings present)")
         return False
 
     page_lc = html.lower()
     eres    = any(tag.lower() in page_lc for tag in _ERS_TAGS)
     ERS_CACHE[rec_url] = eres
-    dbg("_is_eresource", f"{rec_url} → {eres}")
     return eres
 
 # ---------------------------------------------------------------------
@@ -494,34 +509,47 @@ def _is_eresource(rec_url: str) -> bool:
 # ---------------------------------------------------------------------
 def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
     """
-    Decide whether the ESTER record at *rec_url* is the same book as
-    (*w_ttl* / *w_aut*).  Returns True on a confident match.
+    Decide whether *rec_url* describes the same book as (*w_ttl*, *w_aut*).
 
-    • Title  → need every word present in the record’s title
-    • Author → compare canonicalised surname fingerprints
+    Strategy
+    --------
+    • Title  → every token must be present; for 1-word titles the record
+               title must *start with* that word (after ASCII-folding) or
+               be identical.
+    • Author → compare canonicalised surname codes.
     """
     # 1. pull record title / author ----------------------------------
     r_ttl, r_aut = _ester_fields(rec_url)
-    dbg(f"Ester author/title: {r_aut!r} - {r_ttl!r}")
-    if not r_ttl:                     # fetch or parse failed
+    if not r_ttl:                         # fetch or parse failed
         return False
 
-    # 2. tokenise -----------------------------------------------------
+    # 2. tokenise ----------------------------------------------------
     wanted_toks = _tokenise(strip_parens(w_ttl))
     record_toks = _tokenise(r_ttl) | _tokenise(r_aut)
 
-    # ---- TITLE test -------------------------------------------------
-    ttl_ok = wanted_toks <= record_toks
+    # ---- TITLE test ------------------------------------------------
+    if not wanted_toks:
+        ttl_ok = True                    # empty → cannot test
+
+    elif len(wanted_toks) > 1:
+        # multi-word title → wanted tokens must be *subset* of record tokens
+        ttl_ok = wanted_toks <= record_toks
+
+    else:                                # single-word title (e.g. “Dune”)
+        import re
+        word     = next(iter(wanted_toks))          # the only token
+        rec_fold = _ascii_fold(r_ttl).lstrip()       # ASCII-folded record
+        # match start-of-string  word + (space / punctuation / end)
+        ttl_ok   = bool(re.match(rf'^{re.escape(word)}(\W|$)', rec_fold))
 
     # ---- AUTHOR test -----------------------------------------------
-    surname_raw   = _surname(w_aut)            # e.g. “Dostoevsky”
-    surname_parts = _tokenise(surname_raw)     # {'dostoevsky'} or ∅
+    surname_raw   = _surname(w_aut)
+    surname_parts = _tokenise(surname_raw)
 
     wanted_canon  = {_canon_name(p) for p in surname_parts}
     record_canon  = {_canon_name(t) for t in record_toks}
 
-    auth_ok = (not surname_parts               # if no author given, skip test
-               or wanted_canon <= record_canon)
+    auth_ok = (not surname_parts) or wanted_canon <= record_canon
 
     # ---- VERBOSE dump ----------------------------------------------
     if DEBUG:
@@ -537,7 +565,7 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
         print(f"│  canon wanted    : {sorted(wanted_canon)}")
         print(f"│  canon record    : {sorted(record_canon)}")
         verdict = "MATCH" if (ttl_ok and auth_ok) else "SKIP"
-        colour  = "grn"  if verdict == "MATCH"   else "red"
+        colour  = "grn"  if verdict == "MATCH" else "red"
         print(f"└── verdict: {CLR[colour]}{verdict}{CLR['reset']}\n")
 
     return ttl_ok and auth_ok
@@ -1169,7 +1197,7 @@ def _probe(label: str, url: str) -> list[str]:
     return the list of record links that were found.
     """
     # crawl the URL and collect record links
-    links = collect_record_links(url)
+    links = collect_record_links(url, limit=4) # 2 helps for english books, as the first is usually in estonian if exists
     hits  = len(links)
 
     # colour for the progress line (green when there are hits)
@@ -1199,45 +1227,38 @@ def by_keyword(a, t, *, _label="keyword-ttl"):
 
 def search(author: str, title: str, isbn: str) -> list[str]:
     """
-    Return **at most one** ESTER record URL – the first one that fits.
+    Return the first ESTER record whose title & author really match
+    the Goodreads entry.  Strategy:
 
-    Strategy
-    --------
-      1. ISBN (unique)             → accept immediately if a physical record is found
-      2. title-index search        → require title/author token match
-      3. keyword  “author title”   → ditto
-      4. keyword  “title”          → ditto
+      1. ISBN probe
+      2. title-index probe
+      3. keyword  “author title”
+      4. keyword  “title”
     """
-    # -- normalise ----------------------------------------------------
-    title = strip_parens(title)
+    title = strip_parens(title)           # normalise once up-front
 
-    # -- ① ISBN probe -------------------------------------------------
+    # ① ISBN ----------------------------------------------------------------
     if isbn:
-        links = by_isbn(isbn)
-        if links:
-            # The catalogue confirmed the ISBN and the record is physical
-            return links[:1]           # short-circuit – no extra checks
+        for rec in by_isbn(isbn):
+            return [rec]                  # ISBN is unique → accept
 
-    # -- ②–④ fallback probes -----------------------------------------
-    probes = (
-        (by_title_index,               (title,),            "title-idx"),
-        (by_keyword,      (author,     title),              "kw-author+title"),
-        (by_keyword,      ("",         title),              "kw-title-only"),
-    )
-
-    for fn, args, lbl in probes:
-        # skip probes whose arguments are completely empty
-        if not any(args):
-            continue
-
-        # forward the explicit label so _probe() prints it
-        links = fn(*args, _label=lbl)
-
-        for rec in links:                     # validate on the fly
+    # helper: run a probe function and yield only *matching* records
+    def _candidates(fn, *args, _label):
+        for rec in fn(*args, _label=_label):
             if _looks_like_same_book(title, author, rec):
-                return [rec]                  # first convincing hit
+                yield rec
 
-    return []
+    # ②–④ probes ------------------------------------------------------------
+    probes = (
+        (by_title_index,            (title,),          "title-idx"),
+        (by_keyword,      (author,  title),            "kw-author+title"),
+        (by_keyword,      ("",      title),            "kw-title-only"),
+    )
+    for fn, args, lbl in probes:
+        for rec in _candidates(fn, *args, _label=lbl):
+            return [rec]                # first convincing hit
+
+    return []                           # nothing passed the comparator
 
 # ─── worker ──────────────────────────────────────────────────────────
 def _openlib_link(isbn13: str, size: str = "M") -> str:
