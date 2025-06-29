@@ -25,14 +25,19 @@ from metaphone import doublemetaphone
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
 CLR = {k: f"\x1b[{v}m" for k, v in dict(dim=90, cyan=36, yel=33,
-                                         grn=32, red=31, pur=35, reset=0).items()}
+                                         grn=32, red=31, pur=35, white=37, reset=0).items()}
 _WHITES = re.compile(r"\s{2,}")
-def log(tag, msg, col="dim", err=False):
+def log(tag, msg="", col="white", err=False):
     stream = sys.stderr if err or DEBUG else sys.stdout
     print(f"{CLR[col]}{tag}{CLR['reset']} {msg}", file=stream, flush=True)
+
 def dbg(tag, msg="", col="cyan"):
     if DEBUG:
         log(tag, msg, col)
+
+def dbg_pair(tag: str, pair: tuple[str, str]):
+    loc, sta = pair
+    dbg(tag, f"{loc[:38]:38} {sta}")
 
 NOT_FOUND: List[str] = []                # search returned zero records
 NO_KOHAL:  List[str] = []                # record exists, but 0 × KOHAL
@@ -148,6 +153,7 @@ def _surname(author: str) -> str:
 
 # ─── Goodreads CSV loader ────────────────────────────────────────────
 def gd_csv(path: pathlib.Path, limit: int | None):
+    log(f"Loading Goodreads CSV from {path}")
     out=[]
     with path.open(encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
@@ -169,13 +175,15 @@ def parse_web_shelf(uid: str, limit: int | None):
         <span class="greyText">13</span>9789916127209
     so we MUST pick the *last* 13-digit substring.
     """
+    log(f"Scraping Goodreads shelf for {uid}")
     out, page = [], 1
     while True:
         url = (f"{GOODREADS_SHELF}/{uid}"
                "?shelf=to-read&per_page=200"
                f"&page={page}&sort=date_added&view=table")
+        log("→", url)
         soup = BeautifulSoup(_download(url), "html.parser")
-
+        log("→", f"HTML {len(soup.encode()):,} B")
         rows = soup.select("tr[id^='review_']")
         if not rows:
             break
@@ -303,31 +311,44 @@ def collect_record_links(start_url: str,
                          limit: int | None = None) -> list[str]:
     """
     Crawl from *start_url* (frameset or plain list) and return physical-copy
-    record URLs (books only).  Each candidate link is logged exactly once with
-    an “accepted / rejected (reason)” verdict so the debug stream is easy to
-    read.
+    book record URLs.
 
-    Reasons that can appear:
+    Every candidate link is logged **exactly once** with a tidy, aligned
+    verdict so the DEBUG stream is easy to scan:
 
-        + physical     – kept in the results list
-        e-resource     – has only e-copies, skipped
-        non-book       – DVD / CD / etc., skipped
-        duplicate      – we have already stored this record
+        collect open         https://…/frameset&FF=tubik
+        collect + physical   https://…/record=b1784914~S8*est
+        collect - duplicate  https://…/record=b1784914~S8*est
+        collect - e-resource https://…/record=b5362798~S8*est
+
+    Legend
+    ------
+    + physical    ─ accepted, added to *out*
+    - duplicate   ─ we already have that record
+    - e-resource  ─ virtual-only, no physical copies
+    - non-book    ─ CD / DVD / etc.
+
+    The crawl stops when either *limit* accepted records are gathered
+    or more than `_MAX_VISITED` distinct HTML pages were visited.
     """
     q: deque[str] = deque([start_url])
     seen_pages: set[str] = set()
-    out: list[str] = []
+    out: list[str]      = []
 
-    # helper to print a coloured verdict line ------------------------
+    # helper: one **uniformly padded** log-line -----------------------
+    def _col(kind: str, txt: str, colour: str = "dim") -> None:
+        dbg("collect", f"{kind:<12}  {txt}", colour)    # 12-char slot
+
+    # helper: verdict wrapper so we don’t repeat colour tables --------
     def _verdict(rec: str, tag: str) -> None:
-        colour = {
-            "+ physical": "grn",
-            "duplicate":  "red",
-            "e-resource": "red",
-            "non-book":   "red",
-        }.get(tag, "dim")
-        dbg("collect", f"{tag:>12}  {rec}", colour)
+        _col(tag, rec, {
+            "+ physical"  : "grn",
+            "- duplicate" : "dim",
+            "- e-resource": "dim",
+            "- non-book"  : "dim",
+        }.get(tag, "dim"))
 
+    # ────────────────────────────────────────────────────────────────
     while q:
         url = q.popleft()
         key = _canon(url)
@@ -335,7 +356,7 @@ def collect_record_links(start_url: str,
             continue
         seen_pages.add(key)
 
-        dbg("collect open", url, "cyan")
+        _col("open", url, "cyan")                    # page we’re fetching
         soup = BeautifulSoup(_download(url), "html.parser")
 
         # 1. harvest record links on this page -----------------------
@@ -343,22 +364,22 @@ def collect_record_links(start_url: str,
             rec = _uparse.urljoin(url, a["href"])
 
             if _is_eresource(rec):
-                _verdict(rec, "e-resource")
+                _verdict(rec, "- e-resource")
                 continue
             if _is_nonbook(rec):
-                _verdict(rec, "non-book")
+                _verdict(rec, "- non-book")
                 continue
             if rec in out:
-                _verdict(rec, "duplicate")
+                _verdict(rec, "- duplicate")
                 continue
 
             out.append(rec)
             _verdict(rec, "+ physical")
 
-            if limit and len(out) >= limit:
-                return out                       # early stop after N accepted
+            if limit and len(out) >= limit:          # early stop
+                return out
 
-        # 2. enqueue inner “frameset / iframe” documents -------------
+        # 2. follow inner frames / iframes ---------------------------
         leads = (
             [f["href"] for f in soup.select('a[href*="/frameset"]')] +
             [f["src"]  for f in soup.select('frame[src], iframe[src]')]
@@ -373,12 +394,11 @@ def collect_record_links(start_url: str,
             if _canon(nxt) in seen_pages:
                 continue
             if len(seen_pages) >= _MAX_VISITED:
-                dbg("collect", f"    abort – visited>{_MAX_VISITED}", "red")
+                _col("abort", f"visited>{_MAX_VISITED}", "red")
                 return out
             q.append(nxt)
 
     return out
-
 
 # ─── tokenisers / surname helper ─────────────────────────────────────
 _norm_re=re.compile(r"[^a-z0-9]+")
@@ -553,7 +573,7 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
 
     # ---- VERBOSE dump ----------------------------------------------
     if DEBUG:
-        print("┌─  title/author comparator ──────────────────────────────────────")
+        print(f"┌─  title/author comparator ──────────────────────────────────────")
         print(f"│  record URL      : {rec_url}")
         print(f"│  wanted ttl      : {w_ttl!r}")
         print(f"│  record ttl      : {r_ttl!r}")
@@ -566,22 +586,15 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
         print(f"│  canon record    : {sorted(record_canon)}")
         verdict = "MATCH" if (ttl_ok and auth_ok) else "SKIP"
         colour  = "grn"  if verdict == "MATCH" else "red"
-        print(f"└── verdict: {CLR[colour]}{verdict}{CLR['reset']}\n")
+        print(f"└─  verdict: {CLR[colour]}{verdict}{CLR['reset']}\n")
 
     return ttl_ok and auth_ok
-
-# ──────────────────────────────────────────────────────────────────────
-# Helper: pretty-print one (loc, status) pair
-def _dbg_pair(tag: str, pair: tuple[str, str]):
-    loc, sta = pair
-    dbg(tag, f"{loc[:38]:38} {sta}")
 
 # ──────────────────────────────────────────────────────────────────────
 # ❶  Scrape one HTML holdings page
 def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
     dbg("holdings", f"HTML→ {url}")
     html   = _download(url)
-    dbg("holdings", f"      {len(html):,} B fetched")
 
     soup   = BeautifulSoup(html, "html.parser")
     rows   = soup.select("#tab-copies tr[class*='bibItemsEntry'], "
@@ -593,16 +606,16 @@ def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
             out.append((strip_ctrl(tds[0].get_text()).strip(),
                         strip_ctrl(tds[2].get_text()).strip().upper()))
 
-    dbg("holdings", f"      {len(out)} rows matched selector")
+    dbg("holdings", f"{len(out)} rows matched selector")
     if DEBUG and not out:
         dbg("holdings", "      saving HTML preview")
         with open("debug_empty_holdings.html", "w", encoding="utf-8") as fh:
             fh.write(html[:1200])            # write only first 1 200 B
 
-    N = 2                             # how many rows to dump verbosely
+    N = 2
     if DEBUG and out:
         for loc, sta in out[:N]:
-            _dbg_pair("holdings", (loc, sta))
+            dbg_pair("holdings", (loc, sta))
         if len(out) > N:
             dbg("holdings", f"... (+{len(out) - N} more)")
 
@@ -632,9 +645,9 @@ def _copies_via_api(bib: str) -> list[tuple[str, str]]:
         out.append((strip_ctrl(loc), strip_ctrl(sta)))
 
     if DEBUG and out:
-        _dbg_pair("holdings", out[0])
+        dbg_pair("holdings", out[0])
         if len(out) > 1:
-            _dbg_pair("holdings", out[1])
+            dbg_pair("holdings", out[1])
 
     return out
 
@@ -745,13 +758,13 @@ def _scrape_isbns(soup: BeautifulSoup) -> list[str]:
 _MIN_BYTES = 1337 # Google placeholder image is about 10.5KB
 
 # ────────────────────────────────────────────────────────────────────
-#  new _write_covers_page  –  wider tiles, caption under the jacket
+#  write_covers_page  –  wider tiles, caption under the jacket
 # ────────────────────────────────────────────────────────────────────
-def _write_covers_page(outfile: str = "all_covers.html") -> None:
+def write_covers_page(outfile: str = "all_covers.html") -> None:
     """
     Build an HTML gallery – one <figure> per book, cover on top.
     """
-    import html, re
+    log("ℹ", "Writing cover gallery page", "cyan")
 
     gallery: list[tuple[str, str, str]] = []  # (surname-key, title-key, brief)
     seen: set[str] = set()
@@ -1191,39 +1204,42 @@ def _first_google_image(query: str) -> str:
     return ""
 
 # ─── search helpers ──────────────────────────────────────────────────
-def _probe(label: str, url: str) -> list[str]:
-    """
-    Run one ESTER probe, log its hit-count *and* the probe-URL, then
-    return the list of record links that were found.
-    """
-    # crawl the URL and collect record links
-    links = collect_record_links(url, limit=4) # 2 helps for english books, as the first is usually in estonian if exists
+def _probe(label: str, term: str, url: str = "") -> list[str]:
+    # 1. crawl & collect ----------------------------------------------------
+    links = collect_record_links(url, limit=4)
     hits  = len(links)
 
-    # colour for the progress line (green when there are hits)
+    # 2. colour: green if we found anything, red otherwise -----------------
     colour = "grn" if hits else "red"
 
-    # diagnostic summary
-    log("🛰 probe", f"{label:<14} {hits} hit(s)", colour)
-    log("↳", url, "dim")   # always show the exact probe URL
+    # 3. single-line summary -----------------------------------------------
+    log("🔍", f"{label:<14} {term:<30} → {hits} hit{'s' if hits!=1 else ''}",
+        colour)
+
+    # 4. verbose URL (keep in dim so it’s easy to spot if you need it) ------
+    dbg("↳", url)
 
     return links
 
+def by_isbn(isbn):
+    url = (f"{SEARCH}/X?searchtype=X&searcharg={isbn}"
+           "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+    return _probe("keyword-isbn", isbn, url)
 
-def by_isbn(isbn): 
-    return _probe("keyword-isbn",f"{SEARCH}/X?searchtype=X&searcharg={isbn}"
-                                               "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
 def by_title_index(t, *, _label="title-idx"):
-    q = ester_enc(norm_dash(t))
-    return _probe(_label, f"{SEARCH}/X?searchtype=t&searcharg="
-                          f"{urllib.parse.quote_plus(q,safe='{}')}"
-                          "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+    enc  = ester_enc(norm_dash(t))
+    url  = (f"{SEARCH}/X?searchtype=t&searcharg="
+            f"{urllib.parse.quote_plus(enc, safe='{}')}"
+            "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+    return _probe(_label, t, url)
+
 def by_keyword(a, t, *, _label="keyword-ttl"):
     raw = squeeze(f"{a} {t}")
-    q   = ester_enc(norm_dash(raw))
-    return _probe(_label, f"{SEARCH}/X?searchtype=X&searcharg="
-                          f"{urllib.parse.quote_plus(q,safe='{}')}"
-                          "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+    enc = ester_enc(norm_dash(raw))
+    url = (f"{SEARCH}/X?searchtype=X&searcharg="
+           f"{urllib.parse.quote_plus(enc, safe='{}')}"
+           "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
+    return _probe(_label, raw, url)
 
 def search(author: str, title: str, isbn: str) -> list[str]:
     """
@@ -1294,7 +1310,6 @@ def process_title(idx: int, total: int,
 
     t0 = time.time()
     log(f"[{idx:3}/{total}]", f"{author} – {title}", "cyan")
-    log("🔖 ISBN:", isbn or "— none —", "pur")
 
     copies: Counter = Counter()
     meta:   dict    = {}
@@ -1362,6 +1377,8 @@ def build_map(lib_books, meta, coords, outfile):
     if not coords:
         log("!", "Nothing available (KOHAL) on ESTER", "yel", err=True)
         return
+
+    log("ℹ", "Writing map page", "cyan")
 
     # ── centre map roughly on mean location ─────────────────────────
     lats = [la for la, _ in coords.values()]
@@ -1453,11 +1470,13 @@ def main():
     ap.add_argument("--output",type=pathlib.Path,default="want_to_read_map.html")
     a=ap.parse_args(); DEBUG|=a.debug
 
+    log("Hello, Goodreader, my old friend - I’ve come to scrape with you again…")
+
     t0 = time.time()
 
     titles=gd_csv(a.goodreads_csv,a.max_titles) if a.goodreads_csv \
           else parse_web_shelf(a.goodreads_user,a.max_titles)
-    log("ℹ",f"{len(titles)} titles","cyan")
+    log(f"Found {len(titles)} titles")
 
     copies=Counter(); meta={}
     if a.threads==1:
@@ -1472,7 +1491,9 @@ def main():
 
     if not copies:
         log("!", "Nothing available (KOHAL) on ESTER","red",err=True); return
-
+    else:
+        log('✓', f"[Done]", 'grn')
+    
     lib_books = defaultdict(list)          # key → [(display,url), …]
     for (au, ti, key), n in copies.items():
         display = f"{au} – {ti}" + (f" ({n}×)" if n > 1 else "")
@@ -1488,7 +1509,6 @@ def main():
         loc=geocoder(addr); time.sleep(1)
         if loc: coords[k]=(loc.latitude,loc.longitude); cache[k]=coords[k]
     if coords: GEOCACHE.write_text(json.dumps(cache,indent=2,ensure_ascii=False))
-    build_map(lib_books,meta,coords,a.output)
 
     if NOT_FOUND:
         log("\n=== TITLES **NOT FOUND** ON ESTER ===", "", "red")
@@ -1502,8 +1522,9 @@ def main():
             log("•", line, "yel")
         log(f"Total no-KOHAL: {len(NO_KOHAL)}", "", "yel")
 
-    log("ℹ", "Writing cover gallery page", "cyan")
-    _write_covers_page("all_covers.html")
+    build_map(lib_books,meta,coords,a.output)
+
+    write_covers_page("all_covers.html")
 
      # ── cover statistics ───────────────────────────────────────────
     if BOOKS_WITH_COVER:
