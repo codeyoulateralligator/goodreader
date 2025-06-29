@@ -25,7 +25,7 @@ availability status (*KOHAL / TÄHTAEG*) and a side‑panel “shopping list”.
 ## Installation
 
 ```bash
-git clone https://github.com/your-nick/goodreads-ester-mapper.git
+git clone https://github.com/codeyoulateralligator/goodreads-ester-mapper.git
 cd goodreads-ester-mapper
 python -m venv gr
 source gr/bin/activate
