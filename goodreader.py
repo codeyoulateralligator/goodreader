@@ -25,7 +25,7 @@ from metaphone import doublemetaphone
 # ─── debug helpers ───────────────────────────────────────────────────
 DEBUG = bool(int(os.getenv("ESTER_DEBUG", "0")))
 CLR = {k: f"\x1b[{v}m" for k, v in dict(dim=90, cyan=36, yel=33,
-                                         grn=32, red=31, pur=35, white=37, reset=0).items()}
+                                         grn=32, red=31, pur=35, white=39, reset=0).items()}
 _WHITES = re.compile(r"\s{2,}")
 def log(tag, msg="", col="white", err=False):
     stream = sys.stderr if err or DEBUG else sys.stdout
@@ -52,6 +52,7 @@ ERS_CACHE: dict[str, bool] = {}          # record-URL → verdict  (memo)
 COVER_SRC   : Counter[str] = Counter()   # per source “inline/og”, “gbooks”, …
 BOOKS_WITH_COVER = 0                     # total books that ended up with a cover
 GR_META: dict[str, tuple[str, str]] = {}
+GOODREADS_URL: dict[tuple[str, str], str] = {}   # (author, title) → permalink
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -154,27 +155,33 @@ def _surname(author: str) -> str:
 # ─── Goodreads CSV loader ────────────────────────────────────────────
 def gd_csv(path: pathlib.Path, limit: int | None):
     log(f"Loading Goodreads CSV from {path}")
-    out=[]
+    out = []
     with path.open(encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            if row.get("Exclusive Shelf","").lower()!="to-read": continue
-            a = row["Author"].strip()
-            t = row["Title"].strip()
+            if row.get("Exclusive Shelf", "").lower() != "to-read":
+                continue
+
+            author = row["Author"].strip()
+            title  = row["Title"].strip()
+
+            # ------------ NEW: store permalink if “Book Id” column exists ---
+            if bid := row.get("Book Id", "").strip():
+                GOODREADS_URL[(author, title)] = (
+                    f"https://www.goodreads.com/book/show/{bid}"
+                )
+
+            # ISBN extraction as before
             isbn = (row.get("ISBN13") or row.get("ISBN") or "").strip()
-            if isbn.startswith('="') and isbn.endswith('"'): isbn = isbn[2:-1]
-            out.append((a,t,isbn))
-            if limit and len(out)>=limit: break
+            if isbn.startswith('="') and isbn.endswith('"'):
+                isbn = isbn[2:-1]
+
+            out.append((author, title, isbn))
+            if limit and len(out) >= limit:
+                break
     return out
 
 # ─── Goodreads web-shelf scraper (public profile) ────────────────────
 def parse_web_shelf(uid: str, limit: int | None):
-    """
-    Scrape the public “table view” of a Goodreads user’s To-Read shelf.
-
-    The ISBN column renders as:
-        <span class="greyText">13</span>9789916127209
-    so we MUST pick the *last* 13-digit substring.
-    """
     log(f"Scraping Goodreads shelf for {uid}")
     out, page = [], 1
     while True:
@@ -184,25 +191,63 @@ def parse_web_shelf(uid: str, limit: int | None):
         log("→", url)
         soup = BeautifulSoup(_download(url), "html.parser")
         log("→", f"HTML {len(soup.encode()):,} B")
+
         rows = soup.select("tr[id^='review_']")
         if not rows:
             break
 
         for r in rows:
-            a = r.select_one("td.field.author   a")
-            t = r.select_one("td.field.title    a")
-            raw = r.select_one("td.field.isbn13")
-            # take the LAST 13-digit run, ignore leading “13” label
-            digits = re.findall(r"\b\d{13}\b", raw.get_text()) if raw else []
+            a_tag = r.select_one("td.field.title a")
+            au_tag = r.select_one("td.field.author a")
+            raw_isbn = r.select_one("td.field.isbn13")
+
+            if not (a_tag and au_tag):
+                continue
+
+            author = au_tag.get_text(strip=True)
+            title  = a_tag.get_text(strip=True)
+            # ---------- NEW: store the direct link -------------------------
+            GOODREADS_URL[(author, title)] = (
+                "https://www.goodreads.com" + a_tag["href"].split("?")[0]
+            )
+
+            digits = re.findall(r"\b\d{13}\b", raw_isbn.get_text())
             isbn   = digits[-1] if digits else ""
-            if a and t:
-                out.append((a.get_text(strip=True),
-                            t.get_text(strip=True),
-                            isbn))
+            out.append((author, title, isbn))
+
             if limit and len(out) >= limit:
                 return out
         page += 1
     return out
+
+def dual_link(author: str,
+               title:  str,
+               *,
+               ester: str = "",
+               isbn:  str = "") -> str:
+    """
+    Return tiny tag(s) in square brackets:
+
+        [E] – exact ESTER record   (omitted if *ester* == "")
+        [G] – exact Goodreads page (ISBN ▸ permalink ▸ search fallback)
+
+    Always opens in a new tab; tags separated by a thin space (&nbsp;).
+    """
+    # -------- decide Goodreads URL ----------------------------------------
+    if re.fullmatch(r"\d{13}", isbn):
+        gr_url = f"https://www.goodreads.com/book/isbn/{isbn}"
+    else:
+        gr_url = GOODREADS_URL.get((author, title))
+        if not gr_url:
+            q = urllib.parse.quote_plus(f"{author} {title}")
+            gr_url = f"https://www.goodreads.com/search?q={q}"
+
+    est_tag = (f'<a href="{ester}" target="_blank" rel="noopener" '
+               f'title="ESTER">[E]</a>&nbsp;' ) if ester else ""
+    gr_tag  = (f'<a href="{gr_url}" target="_blank" rel="noopener" '
+               f'title="Goodreads">[G]</a>')
+
+    return est_tag + gr_tag
 
 # 1. **single-char** fixes that can go into translate()
 _DEFANG = str.maketrans({
@@ -699,7 +744,7 @@ def pcol(n:int)->str:
     if n<=7: return "beige"
     return "green"
 
-def _safe_id(raw: str) -> str:
+def safe_id(raw: str) -> str:
     """
     Convert *raw* into a stable, HTML- and CSS-safe id attribute.
     - keep ASCII letters, numbers, '-' and '_'
@@ -771,7 +816,7 @@ def write_covers_page(outfile: str = "all_covers.html") -> None:
 
     for (author, title), rec_url in RECORD_URL.items():
         gr_author, gr_title = GR_META.get(rec_url, (author, title))
-        brief = _record_brief(
+        brief = record_brief(
             rec_url,
             f"{gr_author} – {gr_title}",
             isbn_hint = RECORD_ISBN.get(rec_url, ""),
@@ -839,7 +884,7 @@ def strip_any_parens(s: str) -> str:
     return _PARENS.sub(" ", s).strip()
 
 # ── tiny helper used later ------------------------------------------
-def _split_disp(disp: str) -> tuple[str, str]:
+def split_disp(disp: str) -> tuple[str, str]:
     """
     Split Goodreads-style “Author – Title …” → (author, title_without_x)
     Also removes the trailing “ (3×)” copy counter that build_map() adds.
@@ -1015,8 +1060,7 @@ def _find_cover(
     return ""
 
 # ────────────────────────────────────────────────────────────────────
-# ────────────────────────────────────────────────────────────────────
-def _record_brief(
+def record_brief(
     rec,
     fallback_title: str = "",
     *,
@@ -1083,7 +1127,7 @@ def _record_brief(
                             isbn_hint=isbn_hint)
 
     if not cover and isbn_hint:
-        cover = _openlib_link(isbn_hint, "M")            # OpenLibrary fallback
+        cover = openlib_link(isbn_hint, "M")            # OpenLibrary fallback
 
     cover_html = (
         f'<img src="{cover}" loading="lazy" '
@@ -1204,7 +1248,7 @@ def _first_google_image(query: str) -> str:
     return ""
 
 # ─── search helpers ──────────────────────────────────────────────────
-def _probe(label: str, term: str, url: str = "") -> list[str]:
+def probe(label: str, term: str, url: str = "") -> list[str]:
     # 1. crawl & collect ----------------------------------------------------
     links = collect_record_links(url, limit=4)
     hits  = len(links)
@@ -1224,14 +1268,14 @@ def _probe(label: str, term: str, url: str = "") -> list[str]:
 def by_isbn(isbn):
     url = (f"{SEARCH}/X?searchtype=X&searcharg={isbn}"
            "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
-    return _probe("keyword-isbn", isbn, url)
+    return probe("keyword-isbn", isbn, url)
 
 def by_title_index(t, *, _label="title-idx"):
     enc  = ester_enc(norm_dash(t))
     url  = (f"{SEARCH}/X?searchtype=t&searcharg="
             f"{urllib.parse.quote_plus(enc, safe='{}')}"
             "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
-    return _probe(_label, t, url)
+    return probe(_label, t, url)
 
 def by_keyword(a, t, *, _label="keyword-ttl"):
     raw = squeeze(f"{a} {t}")
@@ -1239,7 +1283,7 @@ def by_keyword(a, t, *, _label="keyword-ttl"):
     url = (f"{SEARCH}/X?searchtype=X&searcharg="
            f"{urllib.parse.quote_plus(enc, safe='{}')}"
            "&searchscope=8&SORT=DZ&extended=0&SUBMIT=OTSI")
-    return _probe(_label, raw, url)
+    return probe(_label, raw, url)
 
 def search(author: str, title: str, isbn: str) -> list[str]:
     """
@@ -1276,15 +1320,13 @@ def search(author: str, title: str, isbn: str) -> list[str]:
 
     return []                           # nothing passed the comparator
 
-# ─── worker ──────────────────────────────────────────────────────────
-def _openlib_link(isbn13: str, size: str = "M") -> str:
+def openlib_link(isbn13: str, size: str = "M") -> str:
     # size = S | M | L   – whatever you prefer
     return (
         f"https://covers.openlibrary.org/b/isbn/{isbn13}-{size}.jpg"
         "?default=false"          # << *** key change  ***
     )   
 
-# ─── worker ──────────────────────────────────────────────────────────
 # ----------------------------------------------------------------------
 # worker: process one Goodreads entry  (✓ now passes clean strings down)
 # ----------------------------------------------------------------------
@@ -1334,7 +1376,7 @@ def process_title(idx: int, total: int,
     GR_META[rec]                = (author, title)      # for later pop-ups
 
     # cache the brief (so later steps don’t need to fetch again)
-    _record_brief(
+    record_brief(
         rec,
         fallback_title=f"{author} – {title}",
         isbn_hint      = isbn or "",
@@ -1370,8 +1412,8 @@ def process_title(idx: int, total: int,
 # ─── map builder ─────────────────────────────────────────────────────
 def build_map(lib_books, meta, coords, outfile):
     """
-    lib_books { key → [(display, url)  OR  display_string, …] }
-    meta      { key → (pretty_name, address) }
+    lib_books { key → [(display, url), …] }   display = “Author – Title …”
+    meta      { key → (pretty_library_name, address) }
     coords    { key → (lat, lon) }
     """
     if not coords:
@@ -1380,7 +1422,7 @@ def build_map(lib_books, meta, coords, outfile):
 
     log("ℹ", "Writing map page", "cyan")
 
-    # ── centre map roughly on mean location ─────────────────────────
+    # ── centre roughly on mean lat/lon ───────────────────────────────────
     lats = [la for la, _ in coords.values()]
     lons = [lo for _, lo in coords.values()]
     centre = (sum(lats) / len(lats), sum(lons) / len(lons))
@@ -1389,48 +1431,49 @@ def build_map(lib_books, meta, coords, outfile):
     folium.Element(
         "<style>.leaflet-popup-content{max-width:1600px;}</style>"
     ).add_to(m)
-    m.get_root().html.add_child(folium.Element(_JS_SNIPPET))  # side-panel JS
+    m.get_root().html.add_child(folium.Element(_JS_SNIPPET))
 
-    # ── marker per library ──────────────────────────────────────────
+    # one marker per library ----------------------------------------------
     for key, entries in lib_books.items():
         if key not in coords:
             continue
         lat, lon = coords[key]
         lib_name, _addr = meta[key]
 
-        # sort by author’s surname (ASCII-folded)
+        # sort by ASCII-folded surname
         def _sort_key(entry):
-            disp = entry[0] if isinstance(entry, (tuple, list)) else entry
-            author_part = disp.split("–", 1)[0].strip()
-            return _surname(author_part)
+            return _surname(entry[0].split("–", 1)[0].strip())
 
         entries_sorted = sorted(entries, key=_sort_key)
 
-        # build <li> items
         lis = []
-        for entry in entries_sorted:
-            disp, url = (
-                (entry[0], entry[1]) if isinstance(entry, (tuple, list))
-                else (entry, "")
-            )
-            elem_id = _safe_id(lib_name + disp)
+        for disp, est_url in entries_sorted:
+            auth, titl = split_disp(disp)
+            isbn_hint  = RECORD_ISBN.get(est_url, "")
 
-            if url:
-                gr_author, gr_title = GR_META.get(url, ("", ""))
-                brief_html = _record_brief(
-                    url, disp,
-                    isbn_hint = RECORD_ISBN.get(url, ""),
-                    gr_author = gr_author,
-                    gr_title  = gr_title
+            # compact dual-link prefix
+            tag_prefix = dual_link(auth, titl,
+                                    ester=est_url,
+                                    isbn=isbn_hint) + " "
+
+            if est_url:
+                gr_author, gr_title = GR_META.get(est_url, ("", ""))
+                brief_html = (
+                    tag_prefix +
+                    record_brief(est_url, disp,
+                                  isbn_hint=isbn_hint,
+                                  gr_author=gr_author,
+                                  gr_title=gr_title)
                 )
             else:
-                brief_html = html.escape(disp)
+                # CSV-only entry – no ESTER URL
+                brief_html = tag_prefix + html.escape(disp)
 
-            brief_attr = (
-                brief_html.replace("&", "&amp;")
-                          .replace('"', "&quot;")
-                          .replace("'", "&#39;")
-            )
+            brief_attr = (brief_html.replace("&", "&amp;")
+                                       .replace('"', "&quot;")
+                                       .replace("'", "&#39;"))
+            elem_id = safe_id(lib_name + disp)
+
             lis.append(
                 f'<li id="{elem_id}" data-brief="{brief_attr}" '
                 f'style="cursor:pointer;color:#06c;" '
