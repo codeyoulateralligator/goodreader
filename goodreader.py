@@ -1151,76 +1151,145 @@ def record_brief(
     return brief
 
 _JS_SNIPPET = r"""
-<script>
-/* Helper: rebuild the heading line on demand ------------------------ */
-function headingHTML(hasSel){
-  return (hasSel
-            ? '<button id="closeSel" onclick="clearSelection()" '
-              + 'style="float:right;font-weight:bold;background:#eee;'
-              + 'border:1px solid #999;border-radius:3px;width:1.6em;'
-              + 'height:1.6em;line-height:1.2em;cursor:pointer;">&times;</button>'
-            : '')
-       + '<h3 style="margin:0;">Valitud raamatud</h3>';
-}
-
-/* Simple HTML-entity unescape for tooltips -------------------------- */
-function decodeHTML(str){
-  const t = document.createElement('textarea');
-  t.innerHTML = str;
-  return t.value;
-}
-
-const chosen = new Map();
-
-/* Re-render the panel ------------------------------------------------ */
-function refreshPanel(){
-  const box     = document.getElementById("selectionBox");
-  const hasSel  = chosen.size > 0;
-  const items   = Array.from(chosen.values())
-                       .map(txt => "<p>"+txt+"</p>")
-                       .join("<hr style='margin:.4em 0;width:100%;'>");
-  box.innerHTML = headingHTML(hasSel) + items;
-}
-
-/* Clear everything --------------------------------------------------- */
-function clearSelection(){
-  for (const id of chosen.keys()){
-    const li = document.getElementById(id);
-    if (li) li.style.fontWeight = "normal";
-  }
-  chosen.clear();
-  refreshPanel();
-}
-
-/* Toggle one book in/out of the list --------------------------------- */
-function toggleBook(id){
-  const li = document.getElementById(id);
-  if (chosen.has(id)){
-    chosen.delete(id);
-    li.style.fontWeight = "normal";
-  } else {
-    chosen.set(id, decodeHTML(li.dataset.brief));
-    li.style.fontWeight = "bold";
-  }
-  refreshPanel();
-}
-</script>
-
 <style>
+/* ─── top-left search control ───────────────────────────────────── */
+.searchbox{
+  position:relative;margin:4px 0 0 4px;padding:2px 4px;
+  background:#fff;border:1px solid #999;border-radius:4px;
+  box-shadow:0 1px 4px rgba(0,0,0,.25);z-index:1001;
+}
+.searchbox input{
+  border:0;outline:none;width:200px;font:13px sans-serif;
+}
+
+/* ─── pop-up list of titles ─────────────────────────────────────── */
+.leaflet-popup-content{           /* kill the horizontal scrollbar */
+  max-width:1600px;               /* (keep whatever value you had) */
+  overflow-y:auto;                /* vertical scroll when needed   */
+  overflow-x:hidden;              /* ← no horizontal bar ever      */
+}
+.leaflet-popup-content ul{
+  margin:6px 0 0;
+  padding-left:18px;
+  padding-right:2.5em;            /* wider gutter for bold titles  */
+}
+.leaflet-popup-content li{
+  cursor:pointer;color:#06c;
+}
+.leaflet-popup-content li.sel{
+  font-weight:bold;color:#000;
+}
+
+/* ─── side-panel with picked books ─────────────────────────────── */
 #selectionBox{
-  position:fixed; top:1rem; right:1rem; z-index:9999;
-  max-width:340px; max-height:90vh; overflow:auto;
-  background:#fff; border:2px solid #444; padding:0.5rem 1rem;
-  box-shadow:0 0 8px rgba(0,0,0,.3); font-size:0.9em;
+  position:fixed;top:1rem;right:1rem;z-index:9999;
+  max-width:340px;max-height:90vh;overflow:auto;
+  background:#fff;border:2px solid #444;padding:.5rem 1rem;
+  box-shadow:0 0 8px rgba(0,0,0,.3);font-size:.9em;
+}
+#selectionBox p{
+  margin:.4em 0;
+  line-height:1.25em;
+  clear:both;                      /* start below any cover thumbs */
+}
+#selectionBox hr{
+  clear:both;margin:.4em 0;height:0;border:0;  /* spacing only     */
 }
 </style>
 
-<!-- initial empty panel -->
-<div id="selectionBox">
-  <!-- headingHTML(false) -->
-  <h3 style="margin:0;">Valitud raamatud</h3>
-</div>
+<script>
+(() => {                         /* isolate our symbols */
+
+/* ───── helpers ───── */
+const $  = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+function esc(s){return s.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');}
+function decode(h){const t=document.createElement('textarea');t.innerHTML=h;return t.value;}
+
+/* ───── side-panel state ───── */
+const picked = new Map();
+function header(on){
+  return (on?'<button onclick="clr()" style="float:right;font:bold 18px/14px sans-serif;border:0;background:#eee;cursor:pointer">&times;</button>':'')
+       +  '<h3 style="margin:0;font:16px sans-serif">Valitud raamatud</h3>';
+}
+function refresh(){
+  const box = $('#selectionBox'); if(!box) return;
+  box.innerHTML = header(picked.size)
+    + [...picked.values()].map(t=>'<p>'+t+'</p>').join('<hr style="margin:.4em 0">');
+}
+window.clr = () => { picked.clear(); $$('.sel').forEach(li=>li.classList.remove('sel')); refresh(); };
+window.toggleBook = id => {
+  const li = document.getElementById(id); if(!li) return;
+  if(picked.has(id)){ picked.delete(id); li.classList.remove('sel'); }
+  else              { picked.set(id, decode(li.dataset.brief)); li.classList.add('sel'); }
+  refresh();
+};
+
+/* ───── find the Folium L.map instance ───── */
+function grabFoliumMap(){
+  if(!window.L) return null;
+  for(const k of Object.keys(window)){
+    const v = window[k];
+    if(v && v instanceof L.Map) return v;        /* ← bingo */
+  }
+  return null;
+}
+
+/* ───── install controls once map is there ───── */
+function install(map){
+  /* ─── side-panel skeleton ─────────────────────────────────────── */
+  if(!$('#selectionBox')){
+    const d = document.createElement('div');
+    d.id = 'selectionBox';
+    d.innerHTML = header(false);
+    document.body.appendChild(d);
+  }
+
+  /* ─── live-filter search box (top-left control) ───────────────── */
+  const ctl = L.control({position: 'topleft'});
+  ctl.onAdd = () => {
+    const div = L.DomUtil.create('div', 'searchbox');
+    div.innerHTML =
+      '<input id="mapSearch" placeholder="otsi pop-up nimekirjast">';
+    return div;
+  };
+  ctl.addTo(map);
+
+  const inp = $('#mapSearch');
+  L.DomEvent.disableClickPropagation(inp);
+
+  /* ─── reusable filter routine ─────────────────────────────────── */
+  function applyFilter(){
+    const rx = inp.value
+      ? new RegExp(esc(inp.value.trim()), 'i')
+      : null;
+
+    $$('li[data-brief]').forEach(li => {
+      li.style.display = (!rx || rx.test(li.textContent)) ? '' : 'none';
+    });
+  }
+
+  /* run it while typing … */
+  inp.addEventListener('input', applyFilter);
+
+  /* … and whenever a different popup is opened */
+  map.on('popupopen', applyFilter);
+
+  /* one initial pass (covers browser auto-fill, etc.) */
+  applyFilter();
+}
+
+/* ───── poll until the map exists ───── */
+function wait(){
+  const m = grabFoliumMap();
+  if(m) install(m); else setTimeout(wait,40);
+}
+window.addEventListener('load', wait);
+
+})();           /* IIFE end */
+</script>
 """
+
 
 # ── helper: take first Google Images hit ─────────────────────────────
 def _first_google_image(query: str) -> str:
@@ -1486,7 +1555,7 @@ def build_map(lib_books, meta, coords, outfile):
             f"<b>{html.escape(lib_name)}</b> "
             f"<span style='color:#666;font-size:90%;'>"
             f"({len(entries_sorted)} pealkirja)</span>"
-            f"<ul>{''.join(lis)}</ul></div>"
+            f"<div id='popupContent'><ul>{''.join(lis)}</ul></div></div>"
         )
 
         folium.Marker(
