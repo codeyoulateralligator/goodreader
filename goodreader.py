@@ -1276,10 +1276,18 @@ function install(map){
 
       /* update counter in open popup */
       if(marker.isPopupOpen && marker.isPopupOpen()){
-        const el = marker.getPopup().getElement();
+        const pop = marker.getPopup();
+        const el  = pop.getElement();
         if(el){
           const span = el.querySelector('.hitCount');
           if(span) span.textContent = `(${n} pealkirja)`;
+        }
+        /* ── NEW: force Leaflet to resize the box ── */
+        if(pop.update){                 // Leaflet ≥ 1.9
+          pop.update();                 // public method
+        }else if(pop._updateLayout){    // older Leaflet
+          pop._updateLayout();
+          pop._updatePosition();
         }
       }
     });
