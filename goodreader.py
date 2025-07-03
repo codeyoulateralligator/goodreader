@@ -1163,24 +1163,20 @@ _JS_SNIPPET = r"""
 }
 
 /* ─── pop-up list of titles ─────────────────────────────────────── */
-.leaflet-popup-content{           /* kill the horizontal scrollbar */
-  max-width:1600px;               /* (keep whatever value you had) */
-  overflow-y:auto;                /* vertical scroll when needed   */
-  overflow-x:hidden;              /* ← no horizontal bar ever      */
+.leaflet-popup-content{
+  max-width:1600px;
+  overflow-y:auto;          /* vertical scroll if needed         */
+  overflow-x:hidden;        /* never show horizontal scrollbar   */
 }
 .leaflet-popup-content ul{
   margin:6px 0 0;
   padding-left:18px;
-  padding-right:2.5em;            /* wider gutter for bold titles  */
+  padding-right:2.5em;      /* invisible gutter for bold titles  */
 }
-.leaflet-popup-content li{
-  cursor:pointer;color:#06c;
-}
-.leaflet-popup-content li.sel{
-  font-weight:bold;color:#000;
-}
+.leaflet-popup-content li{cursor:pointer;color:#06c;}
+.leaflet-popup-content li.sel{font-weight:bold;color:#000;}
 
-/* ─── side-panel with picked books ─────────────────────────────── */
+/* ─── fixed side panel (“Valitud raamatud”) ─────────────────────── */
 #selectionBox{
   position:fixed;top:1rem;right:1rem;z-index:9999;
   max-width:340px;max-height:90vh;overflow:auto;
@@ -1188,25 +1184,21 @@ _JS_SNIPPET = r"""
   box-shadow:0 0 8px rgba(0,0,0,.3);font-size:.9em;
 }
 #selectionBox p{
-  margin:.4em 0;
-  line-height:1.25em;
-  clear:both;                      /* start below any cover thumbs */
+  margin:.4em 0;line-height:1.25em;clear:both;
 }
 #selectionBox hr{
-  clear:both;margin:.4em 0;height:0;border:0;  /* spacing only     */
+  clear:both;margin:.4em 0;height:0;border:0;
 }
 </style>
 
 <script>
-(() => {                         /* isolate our symbols */
+(() => {
+/* helpers */
+const   $ = s => document.querySelector(s);
+const  $$ = s => [...document.querySelectorAll(s)];
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/* ───── helpers ───── */
-const $  = s => document.querySelector(s);
-const $$ = s => [...document.querySelectorAll(s)];
-function esc(s){return s.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');}
-function decode(h){const t=document.createElement('textarea');t.innerHTML=h;return t.value;}
-
-/* ───── side-panel state ───── */
+/* side-panel (unchanged) */
 const picked = new Map();
 function header(on){
   return (on?'<button onclick="clr()" style="float:right;font:bold 18px/14px sans-serif;border:0;background:#eee;cursor:pointer">&times;</button>':'')
@@ -1214,79 +1206,100 @@ function header(on){
 }
 function refresh(){
   const box = $('#selectionBox'); if(!box) return;
-  box.innerHTML = header(picked.size)
-    + [...picked.values()].map(t=>'<p>'+t+'</p>').join('<hr style="margin:.4em 0">');
+  box.innerHTML = header(picked.size) +
+    [...picked.values()].map(t=>`<p>${t}</p>`).join('<hr style="margin:.4em 0">');
 }
 window.clr = () => { picked.clear(); $$('.sel').forEach(li=>li.classList.remove('sel')); refresh(); };
 window.toggleBook = id => {
   const li = document.getElementById(id); if(!li) return;
   if(picked.has(id)){ picked.delete(id); li.classList.remove('sel'); }
-  else              { picked.set(id, decode(li.dataset.brief)); li.classList.add('sel'); }
+  else              { picked.set(id, li.dataset.brief.replace(/&amp;/g,'&')); li.classList.add('sel'); }
   refresh();
 };
 
-/* ───── find the Folium L.map instance ───── */
-function grabFoliumMap(){
-  if(!window.L) return null;
-  for(const k of Object.keys(window)){
-    const v = window[k];
-    if(v && v instanceof L.Map) return v;        /* ← bingo */
-  }
-  return null;
-}
+/* colour palette */
+const colourFor = n => n===1 ? 'red' : n<=3 ? 'orange' : n<=7 ? 'beige' : 'green';
 
-/* ───── install controls once map is there ───── */
+/* main installer */
 function install(map){
-  /* ─── side-panel skeleton ─────────────────────────────────────── */
+  /* side panel skeleton */
   if(!$('#selectionBox')){
-    const d = document.createElement('div');
-    d.id = 'selectionBox';
-    d.innerHTML = header(false);
+    const d=document.createElement('div'); d.id='selectionBox'; d.innerHTML=header(false);
     document.body.appendChild(d);
   }
 
-  /* ─── live-filter search box (top-left control) ───────────────── */
-  const ctl = L.control({position: 'topleft'});
+  /* search control */
+  const ctl = L.control({position:'topleft'});
   ctl.onAdd = () => {
-    const div = L.DomUtil.create('div', 'searchbox');
-    div.innerHTML =
-      '<input id="mapSearch" placeholder="otsi pop-up nimekirjast">';
+    const div=L.DomUtil.create('div','searchbox');
+    div.innerHTML='<input id="mapSearch" placeholder="otsi pop-up nimekirjast">';
     return div;
   };
   ctl.addTo(map);
-
   const inp = $('#mapSearch');
   L.DomEvent.disableClickPropagation(inp);
 
-  /* ─── reusable filter routine ─────────────────────────────────── */
-  function applyFilter(){
-    const rx = inp.value
-      ? new RegExp(esc(inp.value.trim()), 'i')
-      : null;
+  /* collect markers */
+  const libMarkers = new Map();            // slug → marker
+  map.eachLayer(l=>{
+    if(l instanceof L.Marker && l.options.libSlug){
+      libMarkers.set(l.options.libSlug, l);
+      /* cache entries array for quick matching */
+      l._entries = (l.options.searchText||'').split('||');
+    }
+  });
 
-    $$('li[data-brief]').forEach(li => {
+  /* filter routine */
+  function applyFilter(){
+    const rx = inp.value ? new RegExp(esc(inp.value.trim()),'i') : null;
+
+    /* 1. hide/show individual <li> when a popup is open */
+    $$('li[data-brief]').forEach(li=>{
       li.style.display = (!rx || rx.test(li.textContent)) ? '' : 'none';
+    });
+
+    /* 2. per-library match count from cached titles */
+    libMarkers.forEach((marker, slug)=>{
+      const n = rx
+        ? marker._entries.filter(t => rx.test(t)).length
+        : marker.options.totalCount;
+
+      /* hide or show the marker */
+      if(n===0){
+        if(map.hasLayer(marker)) map.removeLayer(marker);
+      }else{
+        if(!map.hasLayer(marker)) map.addLayer(marker);
+        marker.setIcon(
+          L.AwesomeMarkers.icon({icon:'book',prefix:'fa',markerColor:colourFor(n)})
+        );
+      }
+
+      /* update counter in open popup */
+      if(marker.isPopupOpen && marker.isPopupOpen()){
+        const el = marker.getPopup().getElement();
+        if(el){
+          const span = el.querySelector('.hitCount');
+          if(span) span.textContent = `(${n} pealkirja)`;
+        }
+      }
     });
   }
 
-  /* run it while typing … */
   inp.addEventListener('input', applyFilter);
-
-  /* … and whenever a different popup is opened */
   map.on('popupopen', applyFilter);
-
-  /* one initial pass (covers browser auto-fill, etc.) */
-  applyFilter();
+  applyFilter();              // first run
 }
 
-/* ───── poll until the map exists ───── */
+/* wait for Folium’s map */
 function wait(){
-  const m = grabFoliumMap();
-  if(m) install(m); else setTimeout(wait,40);
+  for(const k in window){
+    const v = window[k];
+    if(v && v instanceof L.Map){ install(v); return; }
+  }
+  setTimeout(wait,40);
 }
 window.addEventListener('load', wait);
-
-})();           /* IIFE end */
+})();
 </script>
 """
 
@@ -1479,7 +1492,8 @@ def process_title(idx: int, total: int,
     return copies, meta
 
 # ─── map builder ─────────────────────────────────────────────────────
-def build_map(lib_books, meta, coords, outfile):
+# ─── map builder ─────────────────────────────────────────────────────
+def build_map(lib_books: dict, meta: dict, coords: dict, outfile) -> None:
     """
     lib_books { key → [(display, url), …] }   display = “Author – Title …”
     meta      { key → (pretty_library_name, address) }
@@ -1491,78 +1505,75 @@ def build_map(lib_books, meta, coords, outfile):
 
     log("ℹ", "Writing map page", "cyan")
 
-    # ── centre roughly on mean lat/lon ───────────────────────────────────
-    lats = [la for la, _ in coords.values()]
-    lons = [lo for _, lo in coords.values()]
-    centre = (sum(lats) / len(lats), sum(lons) / len(lons))
+    # ── centre roughly on mean lat/lon ──────────────────────────────
+    lat0 = sum(la for la, _ in coords.values()) / len(coords)
+    lon0 = sum(lo for _, lo in coords.values()) / len(coords)
 
-    m = folium.Map(location=centre, zoom_start=13)
-    folium.Element(
-        "<style>.leaflet-popup-content{max-width:1600px;}</style>"
-    ).add_to(m)
+    m = folium.Map(location=(lat0, lon0), zoom_start=13)
+    folium.Element("<style>.leaflet-popup-content{max-width:1600px;}</style>").add_to(m)
     m.get_root().html.add_child(folium.Element(_JS_SNIPPET))
 
-    # one marker per library ----------------------------------------------
     for key, entries in lib_books.items():
         if key not in coords:
             continue
+
         lat, lon = coords[key]
         lib_name, _addr = meta[key]
+        slug = safe_id(lib_name)
 
-        # sort by ASCII-folded surname
-        def _sort_key(entry):
-            return _surname(entry[0].split("–", 1)[0].strip())
-
+        # sort titles by ASCII-folded surname
+        def _sort_key(e): return _surname(e[0].split("–", 1)[0].strip())
         entries_sorted = sorted(entries, key=_sort_key)
 
-        lis = []
+        # build <li> list + plain-text corpus
+        lis, corpus = [], []
         for disp, est_url in entries_sorted:
             auth, titl = split_disp(disp)
             isbn_hint  = RECORD_ISBN.get(est_url, "")
-
-            # compact dual-link prefix
-            tag_prefix = dual_link(auth, titl,
-                                    ester=est_url,
-                                    isbn=isbn_hint) + " "
+            tag_prefix = dual_link(auth, titl, ester=est_url, isbn=isbn_hint) + " "
 
             if est_url:
                 gr_author, gr_title = GR_META.get(est_url, ("", ""))
-                brief_html = (
-                    tag_prefix +
-                    record_brief(est_url, disp,
-                                  isbn_hint=isbn_hint,
-                                  gr_author=gr_author,
-                                  gr_title=gr_title)
-                )
+                brief_html = (tag_prefix +
+                              record_brief(est_url, disp,
+                                           isbn_hint=isbn_hint,
+                                           gr_author=gr_author,
+                                           gr_title=gr_title))
             else:
-                # CSV-only entry – no ESTER URL
                 brief_html = tag_prefix + html.escape(disp)
 
-            brief_attr = (brief_html.replace("&", "&amp;")
-                                       .replace('"', "&quot;")
-                                       .replace("'", "&#39;"))
+            brief_attr = (brief_html
+                          .replace("&",  "&amp;")
+                          .replace('"', "&quot;")
+                          .replace("'", "&#39;"))
             elem_id = safe_id(lib_name + disp)
 
             lis.append(
                 f'<li id="{elem_id}" data-brief="{brief_attr}" '
+                f'data-lib="{slug}" '
                 f'style="cursor:pointer;color:#06c;" '
                 f'onclick="event.stopPropagation();toggleBook(\'{elem_id}\')">'
                 f'{html.escape(disp)}</li>'
             )
+            corpus.append(disp)
 
-        html_popup = (
-            f"<div style='{POPUP_CSS}'>"
+        popup_html = (
+            f"<div style='{POPUP_CSS}' data-lib='{slug}'>"
             f"<b>{html.escape(lib_name)}</b> "
-            f"<span style='color:#666;font-size:90%;'>"
+            f"<span class='hitCount' style='color:#666;font-size:90%;'>"
             f"({len(entries_sorted)} pealkirja)</span>"
             f"<div id='popupContent'><ul>{''.join(lis)}</ul></div></div>"
         )
 
+        icon = folium.Icon(color=pcol(len(entries_sorted)), icon="book", prefix="fa")
+        # add searchText (plain list joined by “||”) so JS always knows the titles
         folium.Marker(
-            location=[lat, lon],
-            popup=folium.Popup(html_popup, max_width=1600, min_width=300),
-            icon=folium.Icon(color=pcol(len(entries_sorted)),
-                             icon="book", prefix="fa"),
+            location=(lat, lon),
+            popup=folium.Popup(popup_html, max_width=1600, min_width=300),
+            icon=icon,
+            libSlug=slug,                                 # used by JS
+            searchText="||".join(corpus),                 # ← NEW
+            totalCount=len(entries_sorted)                # ← NEW
         ).add_to(m)
 
     m.save(outfile)
