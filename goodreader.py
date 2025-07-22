@@ -53,6 +53,7 @@ COVER_SRC   : Counter[str] = Counter()   # per source “inline/og”, “gbooks
 BOOKS_WITH_COVER = 0                     # total books that ended up with a cover
 GR_META: dict[str, tuple[str, str]] = {}
 GOODREADS_URL: dict[tuple[str, str], str] = {}   # (author, title) → permalink
+CALLNUMS: defaultdict[tuple[str, str, str], list[str]] = defaultdict(list)
 
 # ─── constants ───────────────────────────────────────────────────────
 UA = "goodreads-ester/1.32"
@@ -637,19 +638,21 @@ def _looks_like_same_book(w_ttl: str, w_aut: str, rec_url: str) -> bool:
 
 # ──────────────────────────────────────────────────────────────────────
 # ❶  Scrape one HTML holdings page
-def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
+def _scrape_holdings_html(url: str) -> list[tuple[str, str, str]]:
     dbg("holdings", f"HTML→ {url}")
     html   = _download(url)
 
     soup   = BeautifulSoup(html, "html.parser")
     rows   = soup.select("#tab-copies tr[class*='bibItemsEntry'], "
                          ".additionalCopies tr[class*='bibItemsEntry']")
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for r in rows:
         tds = r.find_all("td")
         if len(tds) >= 3:
-            out.append((strip_ctrl(tds[0].get_text()).strip(),
-                        strip_ctrl(tds[2].get_text()).strip().upper()))
+            loc   = strip_ctrl(tds[0].get_text()).strip()
+            call  = strip_ctrl(tds[1].get_text()).strip() if len(tds) > 2 else ""
+            sta   = strip_ctrl(tds[2].get_text()).strip().upper()
+            out.append((loc, call, sta))
 
     dbg("holdings", f"{len(out)} rows matched selector")
     if DEBUG and not out:
@@ -659,8 +662,8 @@ def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
 
     N = 2
     if DEBUG and out:
-        for loc, sta in out[:N]:
-            dbg_pair("holdings", (loc, sta))
+        for loc, call, sta in out[:N]:
+            dbg("holdings", f"{loc[:38]:38} {call[:16]:16} {sta}")
         if len(out) > N:
             dbg("holdings", f"... (+{len(out) - N} more)")
 
@@ -668,7 +671,7 @@ def _scrape_holdings_html(url: str) -> list[tuple[str, str]]:
 
 # ──────────────────────────────────────────────────────────────────────
 # ❷  Ask EPiK JSON endpoint
-def _copies_via_api(bib: str) -> list[tuple[str, str]]:
+def _copies_via_api(bib: str) -> list[tuple[str, str, str]]:
     api = "https://epik.ester.ee/api/data/getItemsByCodeList"
     dbg("holdings", f"API→ {api}  payload=[{bib!r}]")
     try:
@@ -683,27 +686,30 @@ def _copies_via_api(bib: str) -> list[tuple[str, str]]:
     items = data.get("items", [])
     dbg("holdings", f"      {len(items)} item objects")
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for it in items:
-        loc = it.get("libraryNameEst") or it.get("libraryName") or ""
-        sta = (it.get("statusEst") or it.get("status") or "").upper()
-        out.append((strip_ctrl(loc), strip_ctrl(sta)))
+        loc  = it.get("libraryNameEst") or it.get("libraryName") or ""
+        sta  = (it.get("statusEst") or it.get("status") or "").upper()
+        call = (it.get("callNumber") or it.get("callNo") or it.get("kohaviit") or "").strip()
+        out.append((strip_ctrl(loc), strip_ctrl(call), strip_ctrl(sta)))
 
     if DEBUG and out:
-        dbg_pair("holdings", out[0])
+        loc, call, sta = out[0]
+        dbg("holdings", f"{loc[:38]:38} {call[:16]:16} {sta}")
         if len(out) > 1:
-            dbg_pair("holdings", out[1])
+            loc, call, sta = out[1]
+            dbg("holdings", f"{loc[:38]:38} {call[:16]:16} {sta}")
 
     return out
 
 # ──────────────────────────────────────────────────────────────────────
 # ❸  Master helper
-def holdings(rec: str) -> list[tuple[str, str]]:
+def holdings(rec: str) -> list[tuple[str, str, str]]:
     """
     ① fetch …/holdings~   → parse
     ② fetch …/holdingsa~  → parse
     ③ EPiK JSON API       → parse
-    returns [(location, STATUS), …]
+    returns [(location, KOHAVIIT, STATUS), …]
     """
     m = re.search(r"\b(b\d{7})", rec)
     if not m:
@@ -1171,7 +1177,7 @@ _JS_SNIPPET = r"""
 .leaflet-popup-content ul{
   margin:6px 0 0;
   padding-left:18px;
-  padding-right:2.5em;      /* invisible gutter for bold titles  */
+  padding-right:4em;      /* invisible gutter for bold titles  */
 }
 .leaflet-popup-content li{cursor:pointer;color:#06c;}
 .leaflet-popup-content li.sel{font-weight:bold;color:#000;}
@@ -1433,10 +1439,9 @@ def process_title(idx: int, total: int,
 
     Side-effects
     ------------
-    • Populates the global dicts RECORD_URL, RECORD_ISBN and GR_META
-      (used elsewhere for pop-ups and the cover gallery)
-    • Appends a descriptive line to NOT_FOUND  or  NO_KOHAL
-      so the caller can print the two lists separately.
+    • Populates RECORD_URL, RECORD_ISBN, GR_META
+    • Populates CALLNUMS[(author, title, key)] with list of kohaviit strings
+    • Appends to NOT_FOUND / NO_KOHAL
     """
     global NOT_FOUND, NO_KOHAL
 
@@ -1449,23 +1454,18 @@ def process_title(idx: int, total: int,
     # ── ①  look for a matching record on ESTER ──────────────────────
     recs = search(author, title, isbn)
 
-    # ………………………………………………………………………………………………………………………………
-    #  A.  **nothing** found → NOT_FOUND
-    # ………………………………………………………………………………………………………………………………
     if not recs:
         log("✗", "no matching record on ESTER", "red")
         line = f"{author} – {title}" + (f" (ISBN {isbn})" if isbn else "")
         NOT_FOUND.append(line)
         log("⏳", f"{time.time() - t0:.2f}s", "pur")
-        return copies, meta          # empty
+        return copies, meta
 
-    # we have exactly one physical record URL
     rec = recs[0]
     RECORD_URL[(author, title)] = rec
     RECORD_ISBN[rec]            = isbn or ""
-    GR_META[rec]                = (author, title)      # for later pop-ups
+    GR_META[rec]                = (author, title)
 
-    # cache the brief (so later steps don’t need to fetch again)
     record_brief(
         rec,
         fallback_title=f"{author} – {title}",
@@ -1474,21 +1474,20 @@ def process_title(idx: int, total: int,
         gr_title       = title
     )
 
-    # ── ②  scrape holdings → count “KOHAL” copies ───────────────────
-    for loc, status in holdings(rec):
+    # ── ②  scrape holdings → count “KOHAL” copies + collect KOHAVIIT ─
+    for loc, call, status in holdings(rec):
         name, addr = resolve(loc)
         key        = f"{name}|{addr}"
 
         if "KOHAL" in status:
             copies[(author, title, key)] += 1
+            if call:
+                CALLNUMS[(author, title, key)].append(call)
 
         meta[key] = (name, addr)
 
     tot = sum(copies.values())
 
-    # ………………………………………………………………………………………………………………………………
-    #  B.  record exists, but *zero* “KOHAL” → NO_KOHAL
-    # ………………………………………………………………………………………………………………………………
     if tot == 0:
         log("✗", "0 × KOHAL", "red")
         line = f"{author} – {title}" + (f" (ISBN {isbn})" if isbn else "")
@@ -1499,7 +1498,6 @@ def process_title(idx: int, total: int,
     log("⏳", f"{time.time() - t0:.2f}s", "pur")
     return copies, meta
 
-# ─── map builder ─────────────────────────────────────────────────────
 # ─── map builder ─────────────────────────────────────────────────────
 def build_map(lib_books: dict, meta: dict, coords: dict, outfile) -> None:
     """
@@ -1550,6 +1548,14 @@ def build_map(lib_books: dict, meta: dict, coords: dict, outfile) -> None:
             else:
                 brief_html = tag_prefix + html.escape(disp)
 
+            # ── NEW: append kohaviit list for this (book, library) ───
+            calls = CALLNUMS.get((auth, titl, key), [])
+            if calls:
+                unique_calls = sorted(set(calls))
+                brief_html += ("<br><small><b>Kohaviit:</b> " +
+                               ", ".join(html.escape(c) for c in unique_calls) +
+                               "</small>")
+
             brief_attr = (brief_html
                           .replace("&",  "&amp;")
                           .replace('"', "&quot;")
@@ -1574,14 +1580,13 @@ def build_map(lib_books: dict, meta: dict, coords: dict, outfile) -> None:
         )
 
         icon = folium.Icon(color=pcol(len(entries_sorted)), icon="book", prefix="fa")
-        # add searchText (plain list joined by “||”) so JS always knows the titles
         folium.Marker(
             location=(lat, lon),
             popup=folium.Popup(popup_html, max_width=1600, min_width=300),
             icon=icon,
-            libSlug=slug,                                 # used by JS
-            searchText="||".join(corpus),                 # ← NEW
-            totalCount=len(entries_sorted)                # ← NEW
+            libSlug=slug,
+            searchText="||".join(corpus),
+            totalCount=len(entries_sorted)
         ).add_to(m)
 
     m.save(outfile)
