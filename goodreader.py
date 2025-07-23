@@ -1146,8 +1146,11 @@ def record_brief(
     link_start = f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer">' if url else ""
     link_end   = "</a>" if url else ""
 
-    text = (f"{html.escape(nice_author)} – <em>{html.escape(nice_title)}</em>"
-            if nice_author else f"<em>{html.escape(nice_title)}</em>")
+    text = (
+        f"<span style='font-size:1.1em;'>{html.escape(nice_author)} – <em>{html.escape(nice_title)}</em></span>"
+        if nice_author else
+        f"<span style='font-size:1.1em;'><em>{html.escape(nice_title)}</em></span>"
+    )
 
     brief = f"{cover_html}{link_start}{text}{link_end}"
 
@@ -1552,9 +1555,9 @@ def build_map(lib_books: dict, meta: dict, coords: dict, outfile) -> None:
             calls = CALLNUMS.get((auth, titl, key), [])
             if calls:
                 unique_calls = sorted(set(calls))
-                brief_html += ("<br><small><b>Kohaviit:</b> " +
-                               ", ".join(html.escape(c) for c in unique_calls) +
-                               "</small>")
+                brief_html += ("<br><span style='font-size:1.1em;'><b>Kohaviit:</b> " +
+                            ", ".join(html.escape(c) for c in unique_calls) +
+                            "</span>")
 
             brief_attr = (brief_html
                           .replace("&",  "&amp;")
