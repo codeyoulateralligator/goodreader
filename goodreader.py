@@ -1241,7 +1241,7 @@ function install(map){
   const ctl = L.control({position:'topleft'});
   ctl.onAdd = () => {
     const div=L.DomUtil.create('div','searchbox');
-    div.innerHTML='<input id="mapSearch" placeholder="otsi pop-up nimekirjast">';
+    div.innerHTML='<input id="mapSearch" placeholder="otsi nimekirjast">';
     return div;
   };
   ctl.addTo(map);
